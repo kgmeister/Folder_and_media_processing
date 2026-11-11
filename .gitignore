@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+media_processor_log.txt
+dedup_log.txt
+folder_merge_log.txt
