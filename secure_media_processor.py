@@ -3,8 +3,10 @@ r"""
 ========================================================================
  SECURE MEDIA PROCESSOR
 ========================================================================
-Combines fast_media_deduplicator.py (perceptual-hash dedupe, BK-Tree) and
-Media_processor.py (metadata strip + lossless re-encode) into one tool.
+Combines parallel_rename_clean_deduplicate_media_v7.py (perceptual-hash
+dedupe + tidy renaming; its hashing and similarity tests are copied verbatim,
+with a BK-Tree from fast_media_deduplicator.py to skip hopeless comparisons)
+and Media_processor.py (metadata strip + lossless re-encode) into one tool.
 
 It acts on every media file in the folder it is RUN FROM (the current
 working directory) and all of its subfolders. Before touching anything it
@@ -35,7 +37,7 @@ HOW TO RUN:
     Optional: --root-dir "D:\other\folder" to target another folder.
 ========================================================================
 """
-import os, re, sys, shutil, argparse, tempfile, subprocess, time, uuid, atexit, logging, importlib.util
+import os, sys, shutil, argparse, tempfile, subprocess, time, uuid, atexit, logging, importlib.util
 import io, struct, zlib, hashlib
 from pathlib import Path
 from dataclasses import dataclass, field
@@ -82,8 +84,6 @@ TMP_PREFIX = ".mp_tmp_"          # in-progress output files; swept on startup
 LOG_NAME = "media_processor_log.txt"
 VIDEO_REENCODE_MIN_FREE_FACTOR = 10   # need 10x the source size free before an FFV1 encode
 
-RE_PATTERN_NUMBERED = re.compile(r"^(?P<base>.+?) \((?P<num>\d+)\)\.(?P<ext>[^.]+)$", re.I)
-
 # Logger setup
 logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
@@ -92,7 +92,7 @@ log = logging.getLogger(__name__)
 # so pool worker processes don't sweep frame folders that other workers are still using.
 def _sweep_leftover_temp_dirs():
     tdir = Path(tempfile.gettempdir())
-    for d in tdir.glob("vf_*"):
+    for d in tdir.glob("vidframes_*"):
         try: shutil.rmtree(d, ignore_errors=True)
         except OSError: pass
 
@@ -258,146 +258,201 @@ def _collect_folder(folder: Path) -> List[FileEntry]:
         except OSError: pass
     return out
 
-def _rename_to_tmp(src: Path) -> tuple:
-    uid = uuid.uuid4().hex[:6]
-    tmp = src.with_name(f"__tmp_{uid}_{src.name}")
-    return src.rename(tmp), src
-
-def step1_rename(folder: Path, entries: List[FileEntry], workers: int) -> List[FileEntry]:
-    base = folder.name
-    highest, mapping = {}, {}
-
-    # Find next indices
-    for fe in entries:
-        m = RE_PATTERN_NUMBERED.match(fe.path.name)
-        if m and m.group("base") == base:
-            ext = "." + m.group("ext").lower()
-            try: highest[ext] = max(highest.get(ext, 0), int(m.group("num")))
-            except ValueError: pass
-
-    next_idx = {e: n + 1 for e, n in highest.items()}
-    nonconf = [fe for fe in entries if not (m := RE_PATTERN_NUMBERED.match(fe.path.name)) or m.group("base") != base]
-
-    for fe in sorted(nonconf, key=lambda f: f.mtime):
-        ext = fe.path.suffix.lower()
-        idx = next_idx.get(ext, 1)
-        next_idx[ext] = idx + 1
-        mapping[fe.path] = folder / f"{base} ({idx}){ext}"
-
-    if not mapping: return entries
-
-    tmp_to_final = {}
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        for fut in as_completed([pool.submit(_rename_to_tmp, s) for s in mapping]):
-            try:
-                tmp, src = fut.result()
-                tmp_to_final[tmp] = mapping[src]
-            except OSError as e: log.warning(f"Rename failed: {e}")
-
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        for fut in as_completed([pool.submit(lambda t, d: t.rename(d), t, d) for t, d in tmp_to_final.items()]):
-            try: fut.result()
-            except OSError as e: log.warning(f"Rename failed: {e}")
-
-    return _collect_folder(folder)
-
-def _compute_hashes_worker(path: Path, is_vid: bool, hsize: int, frames: int,
-                           ffmpeg: str, ffprobe: str) -> Tuple[Path, Optional[Hashes], bool]:
-    if not is_vid:
-        try:
-            with Image.open(path) as im:
-                im = ImageOps.exif_transpose(im).convert("RGB")
-                return path, ImageHashes(imagehash.phash(im, hash_size=hsize), imagehash.dhash(im, hash_size=hsize)), False
-        except Exception: return path, None, True
-
-    if not ffmpeg: return path, None, True
-
+# ============================================================
+# HASHING - verbatim from parallel_rename_clean_deduplicate_media_v7.py (the battle-tested version).
+# Video frames are sampled at 1/(n+1), 2/(n+1), ... of the duration (25/50/75% for 3 frames).
+# ============================================================
+def _compute_image_hashes(path: Path, hash_size: int) -> Optional[ImageHashes]:
     try:
-        dur_out = subprocess.check_output([ffprobe, "-v", "error", "-show_entries", "format=duration", "-of", "default=nw=1:nk=1", str(path)], stderr=subprocess.STDOUT)
-        dur = max(float(dur_out.strip()), 1.0)
-
-        # Batch extract via fps filter
-        tmp_dir = Path(tempfile.mkdtemp(prefix="vf_"))
-        rate = frames / dur
-        cmd = [ffmpeg, "-y", "-loglevel", "error", "-i", str(path), "-vf", f"fps={rate}", "-frames:v", str(frames), "-q:v", "2", str(tmp_dir / "f_%03d.png")]
-        subprocess.run(cmd, check=False)
-
-        res_frames = []
-        for fp in sorted(tmp_dir.glob("*.png")):
-            try:
-                with Image.open(fp) as im:
-                    im.convert("RGB")
-                    res_frames.append(ImageHashes(imagehash.phash(im, hash_size=hsize), imagehash.dhash(im, hash_size=hsize)))
-            except Exception: pass
-
-        shutil.rmtree(tmp_dir, ignore_errors=True)
-        return path, (VideoHashes(res_frames) if len(res_frames) > 0 else None), len(res_frames) == 0
+        with Image.open(path) as im:
+            im = ImageOps.exif_transpose(im).convert("RGB")
+            return ImageHashes(
+                phash=imagehash.phash(im, hash_size=hash_size),
+                dhash=imagehash.dhash(im, hash_size=hash_size)
+            )
     except Exception:
-        return path, None, True
+        return None
+
+def _probe_duration(ffprobe: str, path: Path) -> float:
+    try:
+        out = subprocess.check_output(
+            [ffprobe, "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=noprint_wrappers=1:nokey=1", str(path)],
+            stderr=subprocess.STDOUT
+        )
+        return float(out.strip())
+    except Exception:
+        return 10.0
+
+def _extract_frame_at(ffmpeg: str, src: Path, t: float, out_dir: Path, idx: int) -> Optional[Path]:
+    out_path = out_dir / f"frame_{idx:02d}.png"
+    try:
+        # Hardened flags to reduce decoder noise/hangs
+        cmd = [
+            ffmpeg, "-y", "-loglevel", "error",
+            "-ss", f"{t:.3f}", "-analyzeduration", "0", "-probesize", "500000",
+            "-err_detect", "ignore_err",
+            "-i", str(src),
+            "-frames:v", "1", "-q:v", "2", str(out_path)
+        ]
+        subprocess.run(cmd, check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return out_path if out_path.exists() else None
+    except Exception:
+        return None
+
+def _compute_video_hashes(path: Path, hash_size: int, num_frames: int, ffmpeg: str, ffprobe: str) -> Optional[VideoHashes]:
+    dur = _probe_duration(ffprobe, path)
+    if dur <= 0:
+        dur = 10.0
+    times = [(dur * (i + 1) / (num_frames + 1)) for i in range(num_frames)]
+    tmp = Path(tempfile.mkdtemp(prefix="vidframes_"))
+    frames: List[ImageHashes] = []
+    try:
+        for i, t in enumerate(times):
+            fp = _extract_frame_at(ffmpeg, path, t, tmp, i)
+            if not fp:
+                continue
+            ih = _compute_image_hashes(fp, hash_size)
+            if not ih:
+                continue
+            frames.append(ih)
+        if not frames:
+            return None
+        return VideoHashes(frames=frames)
+    finally:
+        # Immediate cleanup of per-video temp directory
+        shutil.rmtree(tmp, ignore_errors=True)
+
+def _compute_hashes_worker(fe: FileEntry, hash_size: int, num_frames: int, ffmpeg: Optional[str], ffprobe: Optional[str]) -> Tuple[Path, Optional[Hashes], bool]:
+    """Return (path, hashes_or_None, bad_flag)."""
+    if fe.is_image:
+        h = _compute_image_hashes(fe.path, hash_size)
+        return fe.path, h, (h is None)
+    if fe.is_video and ffmpeg and ffprobe:
+        h = _compute_video_hashes(fe.path, hash_size, num_frames, ffmpeg, ffprobe)
+        return fe.path, h, (h is None)
+    # If it's a video but ffmpeg unavailable, treat as 'bad' so it gets quarantined.
+    if fe.is_video and (not ffmpeg or not ffprobe):
+        return fe.path, None, True
+    return fe.path, None, False
+
+# ============================================================
+# COMPARISON - the similarity tests are verbatim from v7.
+# ============================================================
+def _images_similar(a: ImageHashes, b: ImageHashes, pth: int, dth: int) -> Tuple[bool, int, int]:
+    pd, dd = int(a.phash - b.phash), int(a.dhash - b.dhash)
+    return (pd <= pth and dd <= dth), pd, dd
+
+def _videos_similar(a: VideoHashes, b: VideoHashes, pth: int, dth: int) -> Tuple[bool, List[Tuple[int, int]]]:
+    if len(a.frames) != len(b.frames):
+        return False, []
+    dists: List[Tuple[int, int]] = []
+    for fa, fb in zip(a.frames, b.frames):
+        pd, dd = int(fa.phash - fb.phash), int(fa.dhash - fb.dhash)
+        dists.append((pd, dd))
+        if not (pd <= pth and dd <= dth): return False, dists
+    return True, dists
+
+def find_duplicates(entries: List[FileEntry], hashes: Dict[Path, Hashes], pth: int, dth_img: int, dth_vid: int
+                    ) -> List[Tuple[FileEntry, FileEntry, str]]:
+    """Same decisions as v7's step3_compare_and_dedupe_sequential, which compares every file (oldest first)
+    against every file kept so far and takes the first match. Here a BK-tree on the phash (images) or on the
+    first frame's phash (videos) prunes kept files that can't match - v7's tests require that distance
+    <= pth anyway. Survivors are tested with v7's own functions in v7's order, so both the verdict and the
+    reported base file are identical. Returns (duplicate, base, distances)."""
+    dups: List[Tuple[FileEntry, FileEntry, str]] = []
+    trees = {"image": BKTree(), "video": BKTree()}
+    kept_order: Dict[Path, int] = {}
+    group = [e for e in entries if e.is_image or e.is_video]
+    group.sort(key=lambda fe: fe.mtime)
+    for fe in group:
+        h = hashes.get(fe.path)
+        if h is None: continue
+        typ = "image" if fe.is_image else "video"
+        if not isinstance(h, ImageHashes if typ == "image" else VideoHashes): continue
+        key = h.phash if typ == "image" else h.frames[0].phash
+        candidates = sorted((node.payload for _, node in trees[typ].search(key, pth)), key=lambda b: kept_order[b.path])
+        match = None
+        for base in candidates:
+            hb = hashes[base.path]
+            if typ == "image":
+                ok, pd, dd = _images_similar(h, hb, pth, dth_img)
+                detail = f"phash={pd} dhash={dd}"
+            else:
+                ok, dists = _videos_similar(h, hb, pth, dth_vid)
+                detail = " ".join(f"[p{p}/d{d}]" for p, d in dists)
+            if ok:
+                match = (fe, base, detail)
+                break
+        if match:
+            dups.append(match)
+        else:
+            kept_order[fe.path] = len(kept_order)
+            trees[typ].add(key, fe)
+    return dups
 
 def run_dedupe(folder: Path, dup_dir: Path, corrupt_dir: Path, pool: ProcessPoolExecutor, args) -> Tuple[int, int]:
     entries = _collect_folder(folder)
-
-    # Hashing (CPU Bound + Subprocesses)
-    hashes: Dict[Path, Hashes] = {}
     ffmpeg, ffprobe = which("ffmpeg"), which("ffprobe")
-    # Audio is never hashed, and videos are only hashed when ffmpeg+ffprobe exist (otherwise the
-    # worker reports them as bad and they would all be moved to Corrupted).
+    # Audio is never hashed. Unlike v7, videos are only hashed when ffmpeg+ffprobe exist, so a missing
+    # ffmpeg leaves them in place instead of quarantining every video to Corrupted.
     hashable = [e for e in entries if e.is_image or (e.is_video and ffmpeg and ffprobe)]
-    n_dup = n_bad = 0
-
-    futs = [pool.submit(_compute_hashes_worker, e.path, e.is_video, args.hash_size, args.num_frames, ffmpeg, ffprobe) for e in hashable]
+    hashes: Dict[Path, Hashes] = {}
+    n_bad = 0
+    futs = [pool.submit(_compute_hashes_worker, e, args.hash_size, args.num_frames, ffmpeg, ffprobe) for e in hashable]
     for fut in as_completed(futs):
-        path, h_obj, bad = fut.result()
+        path, h, bad = fut.result()
         if bad:
             log.info(f"CORRUPT | unreadable, moved to {CORRUPT_DIRNAME}: {path}")
             safe_move(path, corrupt_dir)
             n_bad += 1
-        if h_obj: hashes[path] = h_obj
+        elif h is not None:
+            hashes[path] = h
 
+    dups = find_duplicates(_collect_folder(folder), hashes, args.phash_threshold, args.dhash_img_threshold, args.dhash_vid_threshold)
+    for dup, base, detail in dups:
+        kind = "IMG" if dup.is_image else "VID"
+        log.info(f"{kind} DUP | base={base.path.name} | dup={dup.path.name} | {detail}")
+        safe_move(dup.path, dup_dir, new_name=f"{folder.name}_duplicate_{dup.path.name}")
+    return len(dups), n_bad
+
+# ============================================================
+# RENAME - v7's tidy renumbering: per folder and extension, oldest first, numbered 1..N with no gaps.
+# ============================================================
+def _two_phase_rename(mapping: Dict[Path, Path]) -> None:
+    tmp_map: Dict[Path, Path] = {}
+    for src, dst in mapping.items():
+        if src == dst: continue
+        tmp = src.with_name(f"__tmp__{src.name}"); i = 2
+        while tmp.exists(): tmp = src.with_name(f"__tmp__{i}__{src.name}"); i += 1
+        try:
+            src.rename(tmp); tmp_map[tmp] = dst
+        except OSError as e:
+            log.warning(f"Rename failed, left as is: {src} ({e})")
+    for tmp, dst in tmp_map.items():
+        if dst.exists():
+            # v7 deleted whatever was already here; never delete - take the next free name instead.
+            log.warning(f"Rename target already exists, not overwriting: {dst}")
+            dst = free_name(dst)
+        try:
+            tmp.rename(dst)
+        except OSError as e:
+            log.warning(f"Rename failed, file left as {tmp.name}: {e}")
+
+def step4_rerename_tidy(folder: Path) -> int:
     entries = _collect_folder(folder)
-
-    # Fast Deduplication via BK-Tree
-    tree_img = BKTree()
-    tree_vid = BKTree() # Video tree indexes the first frame's phash
-
-    for fe in sorted(entries, key=lambda x: x.mtime):
-        h = hashes.get(fe.path)
-        if not h: continue
-
-        is_dup = False
-        if fe.is_image:
-            candidates = tree_img.search(h.phash, args.phash_threshold)
-            for pd, node in candidates:
-                # The tree stores only the phash, so look up the base file's dhash
-                # (the original read node.hash_val.dhash, which raised AttributeError).
-                dd = int(h.dhash - hashes[node.payload.path].dhash)
-                if dd <= args.dhash_img_threshold:
-                    is_dup = True
-                    log.info(f"IMG DUP | base={node.payload.path.name} | dup={fe.path.name} | p={pd} d={dd}")
-                    break
-            if not is_dup:
-                tree_img.add(h.phash, fe)
-
-        elif fe.is_video:
-            h_vid = h.frames[0]
-            candidates = tree_vid.search(h_vid.phash, args.phash_threshold)
-            for pd, node in candidates:
-                base_h = hashes[node.payload.path]
-                if len(h.frames) == len(base_h.frames):
-                    dists = [(int(fa.phash-fb.phash), int(fa.dhash-fb.dhash)) for fa, fb in zip(h.frames, base_h.frames)]
-                    if all(p <= args.phash_threshold and d <= args.dhash_vid_threshold for p, d in dists):
-                        is_dup = True
-                        log.info(f"VID DUP | base={node.payload.path.name} | dup={fe.path.name} | dists={[d for d in dists]}")
-                        break
-            if not is_dup:
-                tree_vid.add(h_vid.phash, fe)
-
-        if is_dup:
-            safe_move(fe.path, dup_dir, new_name=f"{folder.name}_dup_{fe.path.name}")
-            n_dup += 1
-
-    return n_dup, n_bad
+    if not entries: return 0
+    by_ext: Dict[str, List[FileEntry]] = {}
+    for fe in entries: by_ext.setdefault(fe.path.suffix.lower(), []).append(fe)
+    base = folder.name
+    mapping: Dict[Path, Path] = {}
+    for ext, group in by_ext.items():
+        group.sort(key=lambda fe: fe.mtime)
+        for i, fe in enumerate(group, 1):
+            final = folder / f"{base} ({i}){ext}"
+            if fe.path != final: mapping[fe.path] = final
+    if mapping: _two_phase_rename(mapping)
+    return len(mapping)
 
 # ---------- Lossless verification ----------
 def _frame_signature(im: Image.Image, mode: str) -> bytes:
@@ -837,13 +892,7 @@ def step_reencode(root: Path, pool: ProcessPoolExecutor, ffmpeg: Optional[str], 
 
 def step_rename(root: Path) -> int:
     log.info("=== STEP: renaming ===")
-    renamed = 0
-    for fld in media_folders(root):
-        before = {fe.path.name for fe in _collect_folder(fld)}
-        if not before: continue
-        after = {fe.path.name for fe in step1_rename(fld, _collect_folder(fld), CPU_COUNT)}
-        renamed += len(after - before)
-    return renamed
+    return sum(step4_rerename_tidy(fld) for fld in media_folders(root))
 
 # ---------- Interactive prompts ----------
 def ask_yes_no(question: str) -> bool:
@@ -904,7 +953,8 @@ def main():
     print("\n Files are modified IN PLACE. Make sure you have a backup before continuing.\n")
 
     print("a) RENAMING")
-    print("   Renames every file to '<folder name> (N).<ext>', numbered oldest first.")
+    print("   Renames every file to '<folder name> (N).<ext>', numbered 1..N oldest first, per extension.")
+    print("   Numbering is redone with no gaps, so files already named this way may get a new number.")
     print("   Removes identifying original names (e.g. IMG_20250101_123456.jpg). Content hash: NOT changed.")
     do_rename = ask_yes_no("   Renaming needed?")
 
