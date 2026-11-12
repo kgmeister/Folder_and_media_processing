@@ -1,6 +1,6 @@
-# Builds SecureMediaProcessor.exe on every push to main and publishes it as the latest GitHub release.
-# The app's "Check for updates" (packaged exe) downloads from that release.
-name: Build Windows app
+# Builds the portable Windows app on every push to main and publishes it as the latest GitHub release
+# (SecureMediaProcessor-portable.zip: unzip anywhere, double-click "Secure Media Processor.cmd").
+name: Build portable Windows app
 
 on:
   push:
@@ -25,13 +25,13 @@ jobs:
           python-version: "3.12"
 
       - name: Install dependencies
-        run: python -m pip install -r requirements.txt pyinstaller
+        run: python -m pip install -r requirements.txt
 
       - name: Run tests
         run: python -m pytest -q tests
 
-      - name: Build exe
-        run: python build_exe.py
+      - name: Build portable app
+        run: python make_portable.py --zip
 
       - name: Publish release
         shell: bash
@@ -39,8 +39,8 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           short="${GITHUB_SHA::7}"
-          gh release create "build-${GITHUB_RUN_NUMBER}" dist/SecureMediaProcessor.exe \
+          gh release create "build-${GITHUB_RUN_NUMBER}" dist/SecureMediaProcessor-portable.zip \
             --target "$GITHUB_SHA" \
             --title "Build ${GITHUB_RUN_NUMBER} (${short})" \
-            --notes "commit: ${GITHUB_SHA}" \
+            --notes "Portable app for Windows. Unzip anywhere, then double-click 'Secure Media Processor.cmd'. commit: ${GITHUB_SHA}" \
             --latest

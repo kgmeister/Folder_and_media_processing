@@ -11,28 +11,25 @@ private, put a read-only GitHub token in update_config.json next to this file:
     {"github_token": "github_pat_..."}
 That file is git-ignored, so the token is never committed or pushed.
 
-Three install types:
-  * packaged app (SecureMediaProcessor.exe): downloads the exe from the latest
-    GitHub release (built by .github/workflows/build-windows.yml on every push),
-    checks its sha256, and swaps it in. Restart to use it.
+Install types:
+  * portable app (make_portable.py): the app/ folder is updated like a plain
+    folder (below); if requirements.txt changed, the libraries in its own
+    runtime/ are updated too.
   * git checkout (a .git folder next to this file): `git pull --ff-only`.
     Refuses to run over uncommitted changes and never rewrites local commits.
   * plain folder: downloads the latest snapshot, checks that every .py file
     compiles, backs up the files it replaces to .update_backup/<time>/, then
     copies the new files in. Files deleted upstream are moved to the backup.
 """
-import hashlib, json, os, py_compile, re, shutil, subprocess, sys, tempfile, time, urllib.error, urllib.request, zipfile
+import json, os, py_compile, shutil, subprocess, sys, tempfile, time, urllib.error, urllib.request, zipfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
 REPO = "kgmeister/Folder_and_media_processing"
 BRANCH = "main"
-FROZEN = getattr(sys, "frozen", False)               # running as the packaged .exe
-EXE_ASSET = "SecureMediaProcessor.exe"
 APP_DIR = Path(__file__).resolve().parent
-# The packaged app keeps its config next to the exe (its own files live in a temporary unpack folder).
-CONFIG_FILE = (Path(sys.executable).resolve().parent if FROZEN else APP_DIR) / "update_config.json"
+CONFIG_FILE = APP_DIR / "update_config.json"
 VERSION_FILE = APP_DIR / ".installed_version"      # plain-folder installs: commit sha now installed
 MANIFEST_FILE = APP_DIR / ".installed_files"       # plain-folder installs: files the last update wrote
 BACKUP_DIR = APP_DIR / ".update_backup"
@@ -49,8 +46,6 @@ class UpdateInfo:
     remote_date: str
     remote_message: str
     local_ahead: bool = False  # git checkout whose HEAD already contains the remote commit (unpushed work)
-    download_url: str = ""     # packaged app: the release's exe
-    digest: str = ""           # packaged app: "sha256:<hex>" published by GitHub for that exe
 
     @property
     def up_to_date(self) -> bool:
@@ -84,17 +79,7 @@ def _git(*args: str) -> subprocess.CompletedProcess:
 def is_git_checkout() -> bool:
     return (APP_DIR / ".git").exists() and shutil.which("git") is not None
 
-def build_commit() -> Optional[str]:
-    """Commit the packaged exe was built from (written into _build_info.py by build_exe.py)."""
-    try:
-        import _build_info
-        return _build_info.COMMIT or None
-    except ImportError:
-        return None
-
 def local_version() -> Optional[str]:
-    if FROZEN:
-        return build_commit()
     if is_git_checkout():
         r = _git("rev-parse", "HEAD")
         return r.stdout.strip() if r.returncode == 0 else None
@@ -103,23 +88,7 @@ def local_version() -> Optional[str]:
     except OSError:
         return None
 
-def _check_release() -> UpdateInfo:
-    try:
-        rel = json.loads(_get(f"https://api.github.com/repos/{REPO}/releases/latest"))
-    except UpdateError as e:
-        if "HTTP 404" in str(e):
-            raise UpdateError("No app build has been published on GitHub yet (it is built automatically after a push).")
-        raise
-    m = re.search(r"commit:\s*([0-9a-f]{40})", rel.get("body") or "")
-    asset = next((a for a in rel.get("assets", []) if a.get("name") == EXE_ASSET), None)
-    if not m or asset is None:
-        raise UpdateError(f"The latest release ({rel.get('tag_name')}) has no {EXE_ASSET} or commit id.")
-    return UpdateInfo(build_commit(), m.group(1), rel.get("published_at") or "", rel.get("name") or rel.get("tag_name") or "",
-                      download_url=asset["browser_download_url"], digest=asset.get("digest") or "")
-
 def check() -> UpdateInfo:
-    if FROZEN:
-        return _check_release()
     data = json.loads(_get(f"https://api.github.com/repos/{REPO}/commits/{BRANCH}"))
     commit = data["commit"]
     local = local_version()
@@ -191,68 +160,16 @@ def _apply_snapshot(info: UpdateInfo) -> str:
     where = f" Previous files backed up to {backup}." if backup.exists() else ""
     return f"Installed {info.remote[:7]} ({len(new_files)} files{note}).{where}"
 
-def _download(url: str, dest: Path):
-    req = urllib.request.Request(url, headers={"User-Agent": "SecureMediaProcessor-updater"})
-    tok = _token()
-    if tok:
-        req.add_header("Authorization", f"Bearer {tok}")
-    try:
-        with urllib.request.urlopen(req, timeout=60) as r, open(dest, "wb") as f:
-            shutil.copyfileobj(r, f, 1 << 20)
-    except (urllib.error.URLError, TimeoutError) as e:
-        raise UpdateError(f"Download failed: {getattr(e, 'reason', e)}")
-
-def _apply_exe(info: UpdateInfo, exe: Optional[Path] = None) -> str:
-    """Download the release exe next to the running one, verify it, then swap: Windows lets a running exe be
-    renamed, so the current one becomes .old (removed on the next start) and the new one takes its name."""
-    exe = exe or Path(sys.executable).resolve()
-    new, old = exe.with_name(exe.name + ".download"), exe.with_name(exe.name + ".old")
-    try:
-        _download(info.download_url, new)
-        if info.digest.startswith("sha256:"):
-            h = hashlib.sha256()
-            with open(new, "rb") as f:
-                for chunk in iter(lambda: f.read(1 << 20), b""): h.update(chunk)
-            if h.hexdigest() != info.digest.split(":", 1)[1].lower():
-                raise UpdateError("The download does not match GitHub's published checksum; nothing was changed.")
-        with open(new, "rb") as f:
-            if f.read(2) != b"MZ":
-                raise UpdateError("The download is not a Windows program; nothing was changed.")
-        if old.exists():
-            old.unlink()
-        exe.rename(old)
-        try:
-            new.rename(exe)
-        except OSError:
-            old.rename(exe)                              # put the working version back
-            raise
-    except OSError as e:
-        raise UpdateError(f"Could not replace {exe.name}: {e}")
-    finally:
-        if new.exists():
-            new.unlink()
-    return f"Installed build {info.remote[:7]} ({info.remote_message})."
-
-def cleanup_old_exe():
-    """Remove the previous exe left behind by an update (packaged app only)."""
-    if FROZEN:
-        old = Path(sys.executable).resolve()
-        old = old.with_name(old.name + ".old")
-        try:
-            old.unlink()
-        except OSError:
-            pass
-
 def restart():
-    """Start a fresh copy of the app (packaged exe, or python + this app) and end this one."""
-    args = [sys.executable] if FROZEN else [sys.executable, str(APP_DIR / "app.py")]
+    """Start a fresh copy of the app and end this one."""
+    args = [sys.executable, "-E", "-s", str(APP_DIR / "app.py")]
     flags = {"creationflags": subprocess.DETACHED_PROCESS} if os.name == "nt" else {}
     subprocess.Popen(args + sys.argv[1:], close_fds=True, **flags)
     os._exit(0)
 
 def _refresh_libraries(backup: Path) -> str:
-    """Installed app (install_windows.py) with its own .venv: if requirements.txt changed, install them."""
-    venv_python = APP_DIR / ".venv" / "Scripts" / "python.exe"
+    """Portable app (make_portable.py) with its own runtime: if requirements.txt changed, install them into it."""
+    venv_python = APP_DIR.parent / "runtime" / "python.exe"
     old_reqs = backup / "requirements.txt"
     new_reqs = APP_DIR / "requirements.txt"
     if not venv_python.exists() or not new_reqs.exists():
@@ -262,7 +179,7 @@ def _refresh_libraries(backup: Path) -> str:
     reqs = [l for l in new_reqs.read_text(encoding="utf-8").splitlines()
             if l.strip() and not l.startswith("#") and not l.startswith("pytest")]
     flags = {"creationflags": subprocess.CREATE_NO_WINDOW} if os.name == "nt" else {}
-    r = subprocess.run([str(venv_python), "-m", "pip", "install", "--disable-pip-version-check", "-q", *reqs],
+    r = subprocess.run([str(venv_python), "-E", "-s", "-m", "pip", "install", "--disable-pip-version-check", "-q", *reqs],
                        capture_output=True, text=True, timeout=1800, **flags)
     if r.returncode != 0:
         raise UpdateError(f"New files are installed, but updating libraries failed: {r.stderr.strip()[-300:]}")
@@ -271,8 +188,6 @@ def _refresh_libraries(backup: Path) -> str:
 def apply(info: Optional[UpdateInfo] = None) -> str:
     """Install the latest version. Returns a message; raises UpdateError on failure.
     The running app keeps using the old code until it is restarted."""
-    if FROZEN:
-        return _apply_exe(info or check())
     if is_git_checkout():
         return _apply_git()
     return _apply_snapshot(info or check())

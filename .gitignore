@@ -16,7 +16,5 @@ tools/
 .pytest_cache/
 build/
 
-# build output (python build_exe.py)
+# build output (python make_portable.py)
 dist/
-_build_info.py
-*.spec

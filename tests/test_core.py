@@ -257,19 +257,6 @@ def test_updater_refuses_broken_snapshot(tmp_path, monkeypatch):
         updater.apply(updater.UpdateInfo(None, "f" * 40, "", ""))
     assert (app / "media_core.py").read_text() == "OLD = 1\n"
 
-def test_updater_exe_swap(tmp_path, monkeypatch):
-    exe = tmp_path / "SecureMediaProcessor.exe"; exe.write_bytes(b"MZ old build")
-    new_bytes = b"MZ new build"
-    monkeypatch.setattr(updater, "_download", lambda url, dest: dest.write_bytes(new_bytes))
-    good = updater.UpdateInfo("a" * 40, "b" * 40, "", "Build 7", download_url="x",
-                              digest="sha256:" + __import__("hashlib").sha256(new_bytes).hexdigest())
-    assert "Installed" in updater._apply_exe(good, exe)
-    assert exe.read_bytes() == new_bytes and (tmp_path / "SecureMediaProcessor.exe.old").read_bytes() == b"MZ old build"
-    bad = updater.UpdateInfo("a" * 40, "c" * 40, "", "Build 8", download_url="x", digest="sha256:" + "0" * 64)
-    with pytest.raises(updater.UpdateError):
-        updater._apply_exe(bad, exe)
-    assert exe.read_bytes() == new_bytes and not (tmp_path / "SecureMediaProcessor.exe.download").exists()
-
 # ---------------------------------------------------------------- settings / tools installer
 def test_log_dir_setting(tmp_path, monkeypatch):
     monkeypatch.setattr(core, "SETTINGS_FILE", tmp_path / "settings.json")
@@ -285,36 +272,51 @@ def test_log_dir_setting(tmp_path, monkeypatch):
 def _fake_ffmpeg_zip() -> bytes:
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w") as zf:
-        for name in ("ffmpeg.exe", "ffprobe.exe", "ffplay.exe", "avcodec-61.dll"):
-            zf.writestr(f"ffmpeg-n8.1-win64-lgpl-shared-8.1/bin/{name}", b"MZ fake " + name.encode())
-        zf.writestr("ffmpeg-n8.1-win64-lgpl-shared-8.1/doc/readme.txt", "docs")
+        for name in ("ffmpeg.exe", "ffprobe.exe", "ffplay.exe"):
+            zf.writestr(f"ffmpeg-8.0.1-essentials_build/bin/{name}", b"MZ fake " + name.encode())
+        zf.writestr("ffmpeg-8.0.1-essentials_build/README.txt", "docs")
     return buf.getvalue()
+
+def _patch_download(monkeypatch, ti, blob: bytes, pinned_hash: str):
+    monkeypatch.setattr(ti, "ZIP_SHA256", pinned_hash)
+    monkeypatch.setattr(ti, "_get", lambda url, dest, progress=None: dest.write_bytes(blob))
 
 @pytest.mark.skipif(sys.platform != "win32", reason="ffmpeg install is Windows-only")
 def test_tools_installer_verifies_and_unpacks(tmp_path, monkeypatch):
     import hashlib, tools_installer as ti
     blob = _fake_ffmpeg_zip()
-    def fake_get(url, dest=None, progress=None):
-        if url.endswith("checksums.sha256"):
-            return f"{hashlib.sha256(blob).hexdigest()}  {ti.ZIP_NAME}\n".encode()
-        dest.write_bytes(blob)
-        return b""
-    monkeypatch.setattr(ti, "_get", fake_get)
-    monkeypatch.setattr(ti.subprocess, "run", lambda *a, **k: subprocess.CompletedProcess(a, 0, "ffmpeg version n8.1 Copyright", ""))
+    _patch_download(monkeypatch, ti, blob, hashlib.sha256(blob).hexdigest())
+    monkeypatch.setattr(core, "tool_runs", lambda exe: (True, ""))
     msg = ti.install_ffmpeg(target=tmp_path / "tools")
-    assert sorted(p.name for p in (tmp_path / "tools").iterdir()) == ["avcodec-61.dll", "ffmpeg.exe", "ffprobe.exe"]
-    assert "ffmpeg version n8.1" in msg
+    assert sorted(p.name for p in (tmp_path / "tools").iterdir()) == ["ffmpeg.exe", "ffprobe.exe"]
+    assert "8.0.1" in msg
+
+@pytest.mark.skipif(sys.platform != "win32", reason="ffmpeg install is Windows-only")
+def test_tools_installer_reports_windows_block(tmp_path, monkeypatch):
+    """Smart App Control refusing the downloaded ffmpeg must be a clear message, not a crash."""
+    import hashlib, tools_installer as ti
+    blob = _fake_ffmpeg_zip()
+    _patch_download(monkeypatch, ti, blob, hashlib.sha256(blob).hexdigest())
+    def blocked(*a, **k):
+        e = OSError("An Application Control policy has blocked this file"); e.winerror = 4551; raise e
+    monkeypatch.setattr(core.subprocess, "run", blocked)
+    core._RUN_CHECKS.clear()
+    with pytest.raises(ti.InstallError, match="Smart App Control"):
+        ti.install_ffmpeg(target=tmp_path / "tools")
+    assert not (tmp_path / "tools").exists()
+    core._RUN_CHECKS.clear()
+
+def test_blocked_ffmpeg_counts_as_missing(monkeypatch):
+    """A blocked ffmpeg on PATH would make v7's hashing move every video to Corrupted."""
+    monkeypatch.setattr(core, "which", lambda name: f"C:/fake/{name}.exe")
+    monkeypatch.setattr(core, "tool_runs", lambda exe: (False, "Windows blocked it.") if "ffmpeg" in exe else (True, ""))
+    t = core.find_tools()
+    assert t.ffmpeg is None and "ffmpeg" in t.blocked and t.ffprobe == "C:/fake/ffprobe.exe"
 
 @pytest.mark.skipif(sys.platform != "win32", reason="ffmpeg install is Windows-only")
 def test_tools_installer_rejects_bad_checksum(tmp_path, monkeypatch):
     import tools_installer as ti
-    blob = _fake_ffmpeg_zip()
-    def fake_get(url, dest=None, progress=None):
-        if url.endswith("checksums.sha256"):
-            return f"{'0' * 64}  {ti.ZIP_NAME}\n".encode()
-        dest.write_bytes(blob)
-        return b""
-    monkeypatch.setattr(ti, "_get", fake_get)
-    with pytest.raises(ti.InstallError):
+    _patch_download(monkeypatch, ti, _fake_ffmpeg_zip(), "0" * 64)
+    with pytest.raises(ti.InstallError, match="checksum"):
         ti.install_ffmpeg(target=tmp_path / "tools")
     assert not (tmp_path / "tools").exists()

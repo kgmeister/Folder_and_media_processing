@@ -44,8 +44,6 @@ from typing import Callable, Dict, List, Tuple, Optional, Union
 from concurrent.futures import Executor, ThreadPoolExecutor, ProcessPoolExecutor, as_completed
 
 def _ensure_packages():
-    if getattr(sys, "frozen", False):      # packaged app: everything is bundled, and there is no pip
-        return
     need = {"PIL": "Pillow", "imagehash": "ImageHash", "mozjpeg_lossless_optimization": "mozjpeg-lossless-optimization"}
     missing = [pip for mod, pip in need.items() if importlib.util.find_spec(mod) is None]
     if missing:
@@ -104,7 +102,12 @@ CORRUPT_DIRNAME = "Corrupted"
 SKIP_DIRNAMES = (DUP_DIRNAME, CORRUPT_DIRNAME)
 TMP_PREFIX = ".mp_tmp_"          # in-progress output files; swept on startup
 LOG_NAME = "media_processor_log.txt"
-APP_DATA = Path(os.environ.get("LOCALAPPDATA") or Path.home() / ".local" / "share") / "SecureMediaProcessor"
+# Portable app (built by make_portable.py): <folder>/app/media_core.py next to <folder>/runtime and <folder>/data.
+# Then settings, logs and ffmpeg all live in <folder>/data and nothing is written anywhere else on the PC.
+PORTABLE_ROOT = Path(__file__).resolve().parent.parent
+PORTABLE = (PORTABLE_ROOT / "runtime").is_dir() and (PORTABLE_ROOT / "data").is_dir()
+APP_DATA = (PORTABLE_ROOT / "data" if PORTABLE else
+            Path(os.environ.get("LOCALAPPDATA") or Path.home() / ".local" / "share") / "SecureMediaProcessor")
 SETTINGS_FILE = APP_DATA / "settings.json"
 DEFAULT_LOG_DIR = APP_DATA / "logs"       # outside the processed folder: logs list original names and hashes
 TOOLS_DIR = APP_DATA / "tools"            # where the app installs ffmpeg/ffprobe
@@ -420,7 +423,8 @@ def find_duplicates(entries: List[FileEntry], hashes: Dict[Path, Hashes], pth: i
 
 def run_dedupe(folder: Path, dup_dir: Path, corrupt_dir: Path, pool: Executor, args) -> Tuple[int, int]:
     entries = _collect_folder(folder)
-    ffmpeg, ffprobe = which("ffmpeg"), which("ffprobe")
+    tools = find_tools()                   # only programs that actually run (never a blocked ffmpeg)
+    ffmpeg, ffprobe = tools.ffmpeg, tools.ffprobe
     # Audio is never hashed. Unlike v7, videos are only hashed when ffmpeg+ffprobe exist, so a missing
     # ffmpeg leaves them in place instead of quarantining every video to Corrupted.
     hashable = [e for e in entries if e.is_image or (e.is_video and ffmpeg and ffprobe)]
@@ -1127,6 +1131,25 @@ class Tools:
     ffmpeg: Optional[str]
     ffprobe: Optional[str]
     jpegtran: Optional[str]
+    blocked: Tuple[str, ...] = ()      # found but Windows refuses to run them (Smart App Control)
+
+_RUN_CHECKS: Dict[str, Tuple[bool, str]] = {}
+
+def tool_runs(exe: str) -> Tuple[bool, str]:
+    """Can this program actually start? Windows Smart App Control refuses unsigned programs without a good
+    reputation (WinError 4551). A blocked ffmpeg must count as missing: v7's video hashing would otherwise
+    treat every video as unreadable and move it to Corrupted."""
+    if exe not in _RUN_CHECKS:
+        try:
+            r = subprocess.run([exe, "-version"], capture_output=True, timeout=30)
+            _RUN_CHECKS[exe] = (r.returncode == 0, "" if r.returncode == 0 else f"{Path(exe).name} -version failed.")
+        except OSError as e:
+            blocked = getattr(e, "winerror", None) == 4551
+            _RUN_CHECKS[exe] = (False, f"Windows blocked {Path(exe).name} (Smart App Control: unsigned program "
+                                       "without a known reputation)." if blocked else f"{Path(exe).name} could not start: {e}")
+        except subprocess.TimeoutExpired:
+            _RUN_CHECKS[exe] = (False, f"{Path(exe).name} did not respond.")
+    return _RUN_CHECKS[exe]
 
 def find_tools() -> Tools:
     """PATH lookup, after putting the tools folders first on PATH: a 'tools' folder next to the exe or the
@@ -1135,7 +1158,15 @@ def find_tools() -> Tools:
     for d in (Path(sys.executable).resolve().parent / "tools", Path(__file__).resolve().parent / "tools", TOOLS_DIR):
         if d.is_dir() and str(d) not in os.environ.get("PATH", "").split(os.pathsep):
             os.environ["PATH"] = str(d) + os.pathsep + os.environ.get("PATH", "")
-    return Tools(which("ffmpeg"), which("ffprobe"), which("jpegtran"))
+    found, blocked = {}, []
+    for name in ("ffmpeg", "ffprobe", "jpegtran"):
+        exe = which(name)
+        if exe and not tool_runs(exe)[0]:
+            log.warning(tool_runs(exe)[1] + " Treated as missing.")
+            blocked.append(name)
+            exe = None
+        found[name] = exe
+    return Tools(found["ffmpeg"], found["ffprobe"], found["jpegtran"], tuple(blocked))
 
 @dataclass
 class ScanResult:

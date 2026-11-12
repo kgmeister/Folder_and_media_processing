@@ -20,6 +20,7 @@ import tools_installer
 import updater
 
 APP_TITLE = "Secure Media Processor"
+ASSETS = Path(__file__).resolve().parent / "assets"
 MAX_LOG_LINES = 1500
 
 class UiLogHandler(logging.Handler):
@@ -60,8 +61,8 @@ def main(page: ft.Page):
     page.padding = 16
     page.window.width, page.window.height = 1000, 900
     page.window.min_width, page.window.min_height = 720, 640
+    page.window.icon = str(ASSETS / "icon.ico")
 
-    updater.cleanup_old_exe()
     log_handler = UiLogHandler()
     core.log.addHandler(log_handler)
     picker = ft.FilePicker()
@@ -78,7 +79,9 @@ def main(page: ft.Page):
     def describe_tools(t: core.Tools) -> str:
         jpeg = ("built in" if core.mozjpeg_lossless is not None else
                 "jpegtran" if t.jpegtran else "MISSING (JPEGs are not re-encoded)")
-        av = "found" if (t.ffmpeg and t.ffprobe) else "MISSING (video/audio steps and video dedupe are skipped)"
+        av = ("found" if (t.ffmpeg and t.ffprobe) else
+              "BLOCKED by Windows (video/audio steps and video dedupe are skipped)" if "ffmpeg" in t.blocked else
+              "MISSING (video/audio steps and video dedupe are skipped)")
         return f"ffmpeg: {av} · JPEG optimiser: {jpeg}"
 
     async def refresh_tools():
@@ -91,7 +94,8 @@ def main(page: ft.Page):
 
     async def install_ffmpeg(e=None):
         bar = ft.ProgressBar(value=0, bar_height=6, border_radius=3)
-        msg = ft.Text(f"Downloading ffmpeg (about {tools_installer.APPROX_DOWNLOAD_MB} MB) from the BtbN builds on GitHub...")
+        msg = ft.Text(f"Downloading ffmpeg {tools_installer.VERSION} (about {tools_installer.APPROX_DOWNLOAD_MB} MB) "
+                      "from GitHub...")
         close = ft.TextButton("Close", on_click=lambda ev: page.pop_dialog(), disabled=True)
         page.show_dialog(ft.AlertDialog(modal=True, title=ft.Text("Installing ffmpeg"),
                                         content=ft.Column([msg, bar], tight=True, width=480), actions=[close]))
@@ -105,10 +109,12 @@ def main(page: ft.Page):
             page.update()
             await asyncio.sleep(0.3)
         try:
-            msg.value = job.result() + "\nThe checksum matched BtbN's published sha256."
+            msg.value = job.result() + "\nThe download matched its published sha256 checksum."
             bar.value = 1
         except tools_installer.InstallError as ex:
             msg.value = f"ffmpeg was not installed: {ex}"
+        except Exception as ex:   # noqa: BLE001 - never leave the dialog stuck
+            msg.value = f"ffmpeg was not installed: {type(ex).__name__}: {ex}"
         close.disabled = False
         page.update()
         await refresh_tools()
@@ -127,9 +133,9 @@ def main(page: ft.Page):
         page.show_dialog(ft.AlertDialog(
             modal=True, title=ft.Text("ffmpeg is not installed"),
             content=ft.Text("Video and audio processing, and video duplicate detection, need ffmpeg.\n\n"
-                            f"Download it now? About {tools_installer.APPROX_DOWNLOAD_MB} MB from the BtbN FFmpeg "
-                            "builds on GitHub, checked against their published checksum, installed only for this "
-                            "app (no admin rights, nothing added to the system).", width=480),
+                            f"Download it now? About {tools_installer.APPROX_DOWNLOAD_MB} MB: the official gyan.dev "
+                            f"release {tools_installer.VERSION} from GitHub, checked against its published checksum, "
+                            "installed only for this app (no admin rights, nothing added to the system).", width=480),
             actions=[ft.TextButton("Not now", on_click=lambda ev: page.pop_dialog()),
                      ft.FilledButton("Download and install", icon=ft.Icons.DOWNLOAD, on_click=yes)]))
 
@@ -366,7 +372,7 @@ def main(page: ft.Page):
         if core.log_inside_root(state["log_dir"], state["root"]):
             body.append(ft.Text("The log will be saved inside this folder (it lists original file names).",
                                 color=ft.Colors.ORANGE_800))
-        if opts.reencode and sc and sc.videos:
+        if opts.reencode and sc and sc.videos and state["tools"] and state["tools"].ffmpeg:
             body.append(ft.Text(f"{sc.videos:,} video(s) will be re-encoded to FFV1: expect 5-20x the disk space.",
                                 color=ft.Colors.ORANGE_800))
         body.append(ack)
@@ -427,7 +433,7 @@ def main(page: ft.Page):
 
     # ---------------- Layout ----------------
     version = updater.local_version()
-    header = ft.Row([ft.Icon(ft.Icons.SHIELD, color=ft.Colors.TEAL_700, size=30),
+    header = ft.Row([ft.Image(src="icon.png", width=44, height=44),
                      ft.Column([ft.Text(APP_TITLE, size=22, weight=ft.FontWeight.BOLD),
                                 ft.Text("Offline. Nothing leaves this computer unless you press Install or Update.",
                                         size=12, color=ft.Colors.ON_SURFACE_VARIANT)], spacing=0, expand=True),
@@ -450,4 +456,4 @@ def main(page: ft.Page):
         page.run_task(load_folder, Path(sys.argv[1]))
 
 if __name__ == "__main__":
-    ft.run(main)
+    ft.run(main, assets_dir=str(ASSETS))

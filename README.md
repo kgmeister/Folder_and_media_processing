@@ -4,22 +4,27 @@ Offline tool that cleans a folder of photos, videos and audio before it goes any
 merges `@name` folders, strips metadata, removes duplicates, re-encodes losslessly, gives every file a
 unique content hash, and renames files after their folder. Desktop app and command line run the same engine.
 
-## Install (Windows)
+## Get it (Windows, portable)
 
-**PC with Smart App Control on** (Windows 11 blocks unsigned programs, including a self-built `.exe`):
+The PC version is **portable**: one folder, nothing installed, nothing written outside it.
+
+1. Download `SecureMediaProcessor-portable.zip` from the latest
+   [release](https://github.com/kgmeister/Folder_and_media_processing/releases) (built on every push to `main`),
+   or build it yourself with `python make_portable.py` (output in `dist\SecureMediaProcessor`).
+2. Unzip it anywhere: another drive, a USB stick, any folder.
+3. Double-click **Secure Media Processor.cmd** (a console window flashes for a moment, then the app opens).
 
 ```
-python install_windows.py
+SecureMediaProcessor\
+  Secure Media Processor.cmd   start the app
+  app\                         the app's code and icon
+  runtime\                     its own Python (official python.org files) and libraries
+  data\                        settings, logs and ffmpeg - everything the app writes
 ```
 
-This installs the app for your user in `%LOCALAPPDATA%\Programs\Secure Media Processor` with its own private Python,
-and adds **Secure Media Processor** to the Start Menu and Desktop. The shortcuts start it through Python's signed
-`pythonw.exe`, which Smart App Control allows. Remove with `python install_windows.py --uninstall`.
-
-**Other PCs**: download `SecureMediaProcessor.exe` from the latest
-[release](https://github.com/kgmeister/Folder_and_media_processing/releases) and double-click it. Each push to `main`
-builds a new one (`.github/workflows/build-windows.yml`). To build locally: `pip install -r requirements.txt pyinstaller`,
-then `python build_exe.py` (output in `dist/`).
+To remove it, delete the folder. It works with Windows 11 **Smart App Control** on: Smart App Control blocks unsigned
+programs (which is why there is no `.exe`), but the program that actually runs is Python's own `pythonw.exe`, which
+is signed by the Python Software Foundation.
 
 **From source**: `pip install -r requirements.txt`, then `python app.py` (optionally with a folder path), or
 `python secure_media_processor.py` for the command line, which processes the current folder.
@@ -51,15 +56,17 @@ sizes stay the same however often a file is re-processed (`test_reprocessing_doe
 
 ## ffmpeg
 
-Needed for video/audio and video duplicate detection. The app offers to install it on first start (about 77 MB from
-the [BtbN FFmpeg builds](https://github.com/BtbN/FFmpeg-Builds), checked against their published sha256, installed only
-for this app in `%LOCALAPPDATA%\SecureMediaProcessor\tools`, no admin rights). A `tools/` folder next to the app or
-the `.exe`, or ffmpeg on `PATH`, also works. JPEG optimisation needs nothing extra.
+Needed for video/audio and video duplicate detection. The app offers to install it on first start: about 106 MB, the
+official [gyan.dev](https://www.gyan.dev/ffmpeg/builds/) release 8.0.1 from its GitHub mirror, checked against a pinned
+sha256, saved in the app's `data\tools` folder (no admin rights). It is pinned to that exact release because ffmpeg is
+not code-signed, and Smart App Control only lets unsigned programs run when the exact file is widely known; daily builds
+get blocked. A `tools/` folder next to the app, or ffmpeg on `PATH`, also works. JPEG optimisation needs nothing extra.
 
 ## Logs
 
 Saved to a folder you choose (**Run > Log folder > Change...**; the command line uses the same setting or
-`--log-dir`). Default: `%LOCALAPPDATA%\SecureMediaProcessor\logs`. Logs list original file names and hashes, so the
+`--log-dir`). Default: the portable folder's `data\logs` (`%LOCALAPPDATA%\SecureMediaProcessor\logs` when run from
+source). Logs list original file names and hashes, so the
 app warns when the log folder is inside the folder being processed.
 
 ## Updates
@@ -67,13 +74,12 @@ app warns when the log folder is inside the folder being processed.
 "Check for updates" in the app, or `python secure_media_processor.py --update`. Network access happens only when you
 press Install or Update.
 
-- `.exe`: downloads the exe from the latest release, checks GitHub's sha256, swaps it in, offers **Restart now**.
-- Installed app / plain folder: downloads the latest code, checks it compiles, backs up replaced files to
-  `.update_backup/`, and updates libraries if `requirements.txt` changed.
+- Portable app / plain folder: downloads the latest code, checks it compiles, backs up replaced files to
+  `.update_backup/`, updates the libraries if `requirements.txt` changed, and offers **Restart now**.
 - git checkout: `git pull --ff-only` (refuses to run over uncommitted changes; says so when your copy is ahead).
 
 The repository is public, so no credentials are needed. If it becomes private, put a read-only token in
-`update_config.json` next to the app (or the `.exe`): `{"github_token": "github_pat_..."}`. That file is git-ignored;
+`update_config.json` in the `app` folder: `{"github_token": "github_pat_..."}`. That file is git-ignored;
 never commit it.
 
 ## Tests
@@ -88,7 +94,8 @@ python -m pytest -q tests      # video tests are skipped when ffmpeg is not on P
 - `secure_media_processor.py`: command line
 - `media_core.py`: processing engine used by both
 - `updater.py`, `tools_installer.py`: manual updater, ffmpeg installer
-- `install_windows.py`, `build_exe.py`, `assets/`: Windows install, exe build, icon
+- `make_portable.py`: builds the portable Windows folder
+- `assets/`: the owl icon (`assets/make_icon.py` draws it)
 - `parallel_rename_clean_deduplicate_media_v7.py`: the original, tested dedupe script (reference)
 - `merge_folders_with_prefix.py`: the original folder merge script (reference)
 
