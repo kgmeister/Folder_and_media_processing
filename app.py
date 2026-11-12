@@ -139,8 +139,29 @@ def main(page: ft.Page):
             actions=[ft.TextButton("Not now", on_click=lambda ev: page.pop_dialog()),
                      ft.FilledButton("Download and install", icon=ft.Icons.DOWNLOAD, on_click=yes)]))
 
+    def show_error(title: str, text: str):
+        page.show_dialog(ft.AlertDialog(
+            modal=True, title=ft.Text(title), content=ft.Text(text, selectable=True),
+            actions=[ft.TextButton("OK", on_click=lambda ev: page.pop_dialog())]))
+
+    async def pick_directory(title: str, start: Optional[Path] = None) -> Optional[str]:
+        """Windows' folder dialog fails (0x80070002) when told to start in a folder that does not exist, e.g. a
+        log folder not created yet. Start in the nearest existing parent, retry without a start folder, and
+        report anything else in a dialog instead of letting it take down the whole window."""
+        while start is not None and not start.is_dir():
+            start = start.parent if start.parent != start else None
+        attempts = [str(start), None] if start else [None]
+        error = None
+        for initial in attempts:
+            try:
+                return await picker.get_directory_path(dialog_title=title, initial_directory=initial)
+            except Exception as exc:          # noqa: BLE001 - shown to the user below
+                error = exc
+        show_error("Could not open the folder dialog", f"{error}")
+        return None
+
     async def choose_folder(e):
-        path = await picker.get_directory_path(dialog_title="Choose the folder to process")
+        path = await pick_directory("Choose the folder to process", state["root"])
         if path:
             await load_folder(Path(path))
 
@@ -231,8 +252,7 @@ def main(page: ft.Page):
         log_warn_text.visible = inside
 
     async def change_log_dir(e):
-        path = await picker.get_directory_path(dialog_title="Choose where run logs are saved",
-                                               initial_directory=str(state["log_dir"]))
+        path = await pick_directory("Choose where run logs are saved", Path(state["log_dir"]))
         if path:
             core.set_log_dir(Path(path))
             state["log_dir"] = core.log_dir()
