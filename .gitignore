@@ -22,6 +22,8 @@ dist/*.zip
 # updater state of a source checkout (the portable app's own copy in dist/ IS committed)
 /.installed_version
 src/.installed_version
+src/.release_version
+/.release_version
 /.installed_files
 .update_backup/
 

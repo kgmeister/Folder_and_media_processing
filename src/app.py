@@ -474,27 +474,38 @@ def main(page: ft.Page):
     cancel_btn.on_click = cancel_job
 
     # ---------------- Updates ----------------
+    def version_label(name: Optional[str], sha: Optional[str]) -> str:
+        if name and sha:
+            return f"{name}  ({sha[:7]})"
+        return name or (f"commit {sha[:7]}" if sha else "unknown")
+
     async def check_updates(e):
+        """The only moment the app asks GitHub anything: when this button is pressed."""
         msg = ft.Text("Checking GitHub for the latest version...")
+        status = ft.Text("", weight=ft.FontWeight.W_600)
         actions = [ft.TextButton("Close", on_click=lambda ev: page.pop_dialog())]
-        dlg = ft.AlertDialog(modal=True, title=ft.Text("Updates"), content=ft.Column([msg], tight=True, width=dlg_w),
-                             actions=actions)
+        dlg = ft.AlertDialog(modal=True, title=ft.Text("Updates"),
+                             content=ft.Column([msg, status], tight=True, spacing=10, width=dlg_w), actions=actions)
         page.show_dialog(dlg)
         try:
             info = await asyncio.to_thread(updater.check)
         except updater.UpdateError as ex:
-            msg.value = f"Could not check for updates: {ex}"
+            msg.value = f"This version: {updater.describe_local()}\n\nCould not check for updates: {ex}"
             page.update()
             return
-        installed = (info.local or "unknown")[:7]
+        msg.value = (f"This version:   {version_label(info.local_name, info.local)}\n"
+                     f"Latest version: {version_label(info.remote_name, info.remote)}"
+                     + (f", released {info.remote_date[:10]}" if info.remote_date else "")
+                     + (f"\nWhat's new: {info.remote_message}" if info.remote_message else ""))
+        version_text.value = f"Version {info.local_name or updater.describe_local()} · latest {info.remote_name}"
         if info.up_to_date:
-            msg.value = (f"This copy ({installed}) is ahead of GitHub ({info.remote[:7]}): it has commits that "
-                         "are not pushed yet. Nothing to update." if info.local_ahead else
-                         f"You have the latest version ({installed}).")
+            status.value, status.color = (
+                ("This copy is newer than the latest release: it has changes that are not released yet.",
+                 ft.Colors.ON_SURFACE_VARIANT) if info.local_ahead else
+                ("You have the latest version.", ft.Colors.TEAL_700))
             page.update()
             return
-        msg.value = (f"Installed: {installed}\nLatest:    {info.remote[:7]}  ({info.remote_date[:10]})\n"
-                     f"{info.remote_message}")
+        status.value, status.color = "An update is available.", ft.Colors.ORANGE_800
 
         if info.download_url:          # Android: Android itself installs the new APK
             async def get_apk(ev):
@@ -503,7 +514,8 @@ def main(page: ft.Page):
                               "Update. (The first time, Android asks you to allow installs from your browser.) "
                               "Your settings are kept.")
                 page.update()
-            dlg.actions = [ft.FilledButton("Download update", icon=ft.Icons.DOWNLOAD, on_click=get_apk), *actions]
+            dlg.actions = [ft.FilledButton(f"Download {info.remote_name}", icon=ft.Icons.DOWNLOAD, on_click=get_apk),
+                           *actions]
             page.update()
             return
 
@@ -520,19 +532,19 @@ def main(page: ft.Page):
                 msg.value = f"Update failed, nothing was changed: {ex}"
             page.update()
 
-        install = ft.FilledButton("Update now", icon=ft.Icons.DOWNLOAD, on_click=do_update)
+        install = ft.FilledButton(f"Update to {info.remote_name}", icon=ft.Icons.DOWNLOAD, on_click=do_update)
         dlg.actions = [install, *actions]
         page.update()
 
     update_btn = ft.TextButton("Check for updates", icon=ft.Icons.SYSTEM_UPDATE, on_click=check_updates)
 
     # ---------------- Layout ----------------
-    version = updater.local_version()
     device = "phone" if mobile else "computer"
     title_col = ft.Column([ft.Text(APP_TITLE, size=20 if mobile else 22, weight=ft.FontWeight.BOLD),
                            ft.Text(f"Offline. Nothing leaves this {device} unless you press Install or Update.",
                                    size=12, color=ft.Colors.ON_SURFACE_VARIANT)], spacing=0, expand=True)
-    version_text = ft.Text(f"version {version[:7]}" if version else "", size=12, color=ft.Colors.ON_SURFACE_VARIANT)
+    # This copy's version, read locally (no network). The latest version is shown after "Check for updates".
+    version_text = ft.Text(f"Version {updater.describe_local()}", size=12, color=ft.Colors.ON_SURFACE_VARIANT)
     icon = ft.Image(src="icon.png", width=40 if mobile else 44, height=40 if mobile else 44)
     if mobile:      # narrow screen: stack what sits side by side on the PC
         header = ft.Column([ft.Row([icon, title_col]), ft.Row([version_text, update_btn],

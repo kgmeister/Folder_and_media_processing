@@ -33,6 +33,8 @@ jobs:
         run: python -m pytest -q tests
 
       - name: Build portable app
+        env:
+          SMP_RELEASE_VERSION: 1.0.${{ github.run_number }}     # the version the app shows
         run: python scripts/make_portable.py --zip
 
       - uses: actions/upload-artifact@v7
@@ -81,7 +83,9 @@ jobs:
         run: python scripts/android_ffmpeg_wheel.py android-ffmpeg android-ffmpeg-wheel --add-to-pyproject
 
       - name: Record the version for "Check for updates"
-        run: echo "$GITHUB_SHA" > src/.installed_version
+        run: |
+          echo "$GITHUB_SHA" > src/.installed_version
+          echo "1.0.$GITHUB_RUN_NUMBER" > src/.release_version
 
       - name: Build APK
         env:

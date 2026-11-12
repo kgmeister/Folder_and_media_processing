@@ -17,7 +17,7 @@ Why a signed Python and a .cmd launcher instead of an .exe: Windows 11 Smart App
 programs, and any .exe we build ourselves is unsigned. pythonw.exe is signed, so the app runs.
 Build it with the same Python version you want inside (3.12 here); the libraries are installed for it.
 """
-import argparse, shutil, subprocess, sys, time
+import argparse, os, shutil, subprocess, sys, time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -102,11 +102,16 @@ def main() -> int:
     if args.zip:
         # The zipped copy updates itself by download and needs to know its version. The copy committed in dist/
         # gets it from git instead (a version file there could never name the commit that contains it).
+        # SMP_RELEASE_VERSION (set by the build, e.g. "1.0.7") is the version the app shows.
         version = OUT / "app" / ".installed_version"
+        release = OUT / "app" / ".release_version"
         if commit:
             version.write_text(commit + "\n", encoding="utf-8")
+        if os.environ.get("SMP_RELEASE_VERSION"):
+            release.write_text(os.environ["SMP_RELEASE_VERSION"] + "\n", encoding="utf-8")
         z = shutil.make_archive(str(ROOT / "dist" / "SecureMediaProcessor-portable"), "zip", OUT.parent, OUT.name)
         version.unlink(missing_ok=True)
+        release.unlink(missing_ok=True)
         print(f"Zipped to {z}")
     return 0
 

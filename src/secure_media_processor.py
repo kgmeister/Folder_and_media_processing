@@ -32,13 +32,15 @@ def ask_yes_no(question: str) -> bool:
 def run_update() -> int:
     import updater
     try:
+        print(f"This version:   {updater.describe_local()}")
         info = updater.check()
-        print(f"Installed: {(info.local or 'unknown')[:7]}   Latest: {info.remote[:7]} ({info.remote_date}) {info.remote_message}")
+        print(f"Latest version: {info.remote_name} ({info.remote[:7]}, released {info.remote_date[:10]}) "
+              f"{info.remote_message}")
         if info.up_to_date:
-            print("This copy is ahead of GitHub (unpushed commits). Nothing to update." if info.local_ahead
-                  else "Already up to date.")
+            print("This copy is newer than the latest release (changes not released yet). Nothing to update."
+                  if info.local_ahead else "You have the latest version.")
             return 0
-        if not ask_yes_no("Install the latest version?"):
+        if not ask_yes_no(f"Update to {info.remote_name}?"):
             return 0
         print(updater.apply(info))
         return 0

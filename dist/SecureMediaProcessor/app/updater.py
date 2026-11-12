@@ -39,10 +39,12 @@ ANDROID = os.environ.get("FLET_PLATFORM") == "android" or sys.platform == "andro
 APP_DIR = Path(__file__).resolve().parent
 CONFIG_FILE = APP_DIR / "update_config.json"
 VERSION_FILE = APP_DIR / ".installed_version"      # plain-folder installs: commit sha now installed
+RELEASE_FILE = APP_DIR / ".release_version"        # zip / APK / updated copies: release name, e.g. "1.0.7"
 MANIFEST_FILE = APP_DIR / ".installed_files"       # plain-folder installs: files the last update wrote
 BACKUP_DIR = APP_DIR / ".update_backup"
 # Never touched by an update: local config/state, bundled binaries, logs, git internals.
-PRESERVE = {"update_config.json", ".installed_version", ".installed_files", ".update_backup", ".git", "tools", ".venv"}
+PRESERVE = {"update_config.json", ".installed_version", ".release_version", ".installed_files", ".update_backup",
+            ".git", "tools", ".venv"}
 
 class UpdateError(Exception):
     pass
@@ -50,11 +52,13 @@ class UpdateError(Exception):
 @dataclass
 class UpdateInfo:
     local: Optional[str]       # commit sha currently installed (None = unknown)
-    remote: str                # latest commit sha on the branch
+    remote: str                # commit sha of the latest release
     remote_date: str
-    remote_message: str
-    local_ahead: bool = False  # git checkout whose HEAD already contains the remote commit (unpushed work)
+    remote_message: str        # first line of that commit's message
+    local_ahead: bool = False  # this copy is newer than the latest release (changes not released yet)
     download_url: str = ""     # Android: the APK of the latest release
+    remote_name: str = ""      # the latest release's version, e.g. "1.0.7"
+    local_name: Optional[str] = None   # this copy's release version, if it is one
 
     @property
     def up_to_date(self) -> bool:
@@ -103,26 +107,60 @@ def local_version() -> Optional[str]:
     except OSError:
         return None
 
-def _check_release() -> UpdateInfo:
-    """Android: the latest release, created by CI with --target <commit sha>, carries the APK."""
-    data = json.loads(_get(f"https://api.github.com/repos/{REPO}/releases/latest"))
-    asset = next((a for a in data.get("assets", []) if a.get("name") == APK_ASSET), None)
-    if asset is None:
-        raise UpdateError("The latest release has no Android app (its build may still be running, or it failed). "
-                          "Try again later.")
-    return UpdateInfo(local_version(), data.get("target_commitish", ""), data.get("published_at", ""),
-                      data.get("name", ""), download_url=asset["browser_download_url"])
+def local_release_name() -> Optional[str]:
+    """This copy's release version ("1.0.7"), written by the build into the zip and the APK, and by updates."""
+    try:
+        return RELEASE_FILE.read_text(encoding="utf-8").strip() or None
+    except OSError:
+        return None
+
+def describe_local() -> str:
+    """This copy's version for display, without going online."""
+    name, sha = local_release_name(), local_version()
+    return name or (f"commit {sha[:7]}" if sha else "unknown")
+
+def _apk_url(release: dict) -> str:
+    return next((a["browser_download_url"] for a in release.get("assets", []) if a.get("name") == APK_ASSET), "")
+
+def _releases() -> list:
+    """Published releases, newest first. Every push to main makes one (1.0.<build>), tagged on its commit."""
+    data = json.loads(_get(f"https://api.github.com/repos/{REPO}/releases?per_page=50"))
+    rel = [r for r in data if not r.get("draft") and not r.get("prerelease") and r.get("target_commitish")]
+    rel.sort(key=lambda r: r.get("published_at") or r.get("created_at") or "", reverse=True)
+    return rel
+
+def _is_newer_than(local: str, release_sha: str) -> bool:
+    """True when commit `local` already contains `release_sha` (this copy has changes not released yet)."""
+    if is_git_checkout():
+        return _git("merge-base", "--is-ancestor", release_sha, local).returncode == 0
+    try:
+        status = json.loads(_get(f"https://api.github.com/repos/{REPO}/compare/{release_sha}...{local}"))["status"]
+    except (UpdateError, KeyError, ValueError):
+        return False                      # a commit GitHub does not know: offer the release
+    return status == "ahead"
 
 def check() -> UpdateInfo:
-    if ANDROID:
-        return _check_release()
-    data = json.loads(_get(f"https://api.github.com/repos/{REPO}/commits/{BRANCH}"))
-    commit = data["commit"]
+    """Compare this copy with the latest release (on Android: the latest release that has an APK)."""
+    releases = _releases()
+    candidates = [r for r in releases if _apk_url(r)] if ANDROID else releases
+    if not candidates:
+        raise UpdateError("There is no release on GitHub yet (a build may still be running). Try again later."
+                          if not ANDROID else "No release has an Android app yet. Try again later.")
+    latest = candidates[0]
+    remote = latest["target_commitish"]
     local = local_version()
-    ahead = (is_git_checkout() and local is not None and local != data["sha"]
-             and _git("merge-base", "--is-ancestor", data["sha"], local).returncode == 0)
-    return UpdateInfo(local, data["sha"], commit["committer"]["date"],
-                      commit["message"].splitlines()[0] if commit["message"] else "", ahead)
+    by_sha = {r["target_commitish"]: r["tag_name"] for r in releases}
+    local_name = by_sha.get(local) if local else None
+    local_name = local_name or local_release_name()
+    ahead = bool(local and local != remote and local not in by_sha and _is_newer_than(local, remote))
+    try:
+        commit = json.loads(_get(f"https://api.github.com/repos/{REPO}/commits/{remote}"))["commit"]
+        message = commit["message"].splitlines()[0] if commit.get("message") else ""
+    except (UpdateError, KeyError, ValueError):
+        message = ""
+    return UpdateInfo(local, remote, latest.get("published_at", ""), message, ahead,
+                      download_url=_apk_url(latest) if ANDROID else "", remote_name=latest["tag_name"],
+                      local_name=local_name)
 
 def _remote_url() -> str:
     tok = _token()
@@ -207,10 +245,12 @@ def _apply_snapshot(info: UpdateInfo) -> str:
                 removed += 1
         MANIFEST_FILE.write_text("\n".join(str(p) for p in new_files) + "\n", encoding="utf-8")
         VERSION_FILE.write_text(info.remote + "\n", encoding="utf-8")
+        if info.remote_name:
+            RELEASE_FILE.write_text(info.remote_name + "\n", encoding="utf-8")
     note = f", {removed} removed" if removed else ""
     note += _refresh_libraries(backup)
     where = f" Previous files backed up to {backup}." if backup.exists() else ""
-    return f"Installed {info.remote[:7]} ({len(new_files)} files{note}).{where}"
+    return f"Installed {info.remote_name or info.remote[:7]} ({len(new_files)} files{note}).{where}"
 
 def restart():
     """Start a fresh copy of the app and end this one."""
@@ -248,5 +288,6 @@ def apply(info: Optional[UpdateInfo] = None) -> str:
 
 if __name__ == "__main__":
     i = check()
-    print(f"installed: {i.local or 'unknown'}\nlatest:    {i.remote} ({i.remote_date}) {i.remote_message}")
+    print(f"this version:   {i.local_name or describe_local()}\nlatest version: {i.remote_name} "
+          f"({i.remote[:7]}, {i.remote_date[:10]}) {i.remote_message}")
     print("Up to date." if i.up_to_date else apply(i))

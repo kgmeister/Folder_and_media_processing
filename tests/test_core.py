@@ -239,7 +239,7 @@ def fake_github(monkeypatch, files: dict, tamper: str = ""):
 def point_updater_at(app: Path, monkeypatch):
     for name, value in (("APP_DIR", app), ("CONFIG_FILE", app / "update_config.json"),
                         ("VERSION_FILE", app / ".installed_version"), ("MANIFEST_FILE", app / ".installed_files"),
-                        ("BACKUP_DIR", app / ".update_backup")):
+                        ("BACKUP_DIR", app / ".update_backup"), ("RELEASE_FILE", app / ".release_version")):
         monkeypatch.setattr(updater, name, value)
 
 def test_updater_snapshot_install(tmp_path, monkeypatch):
@@ -331,22 +331,78 @@ def test_android_finds_bundled_ffmpeg(tmp_path, monkeypatch):
     t = core.find_tools()                                    # present but not runnable -> treated as missing
     assert t.ffmpeg is None and t.ffprobe is None and t.blocked == ("ffmpeg", "ffprobe")
 
-def test_android_update_check_uses_latest_release_apk(tmp_path, monkeypatch):
-    app = tmp_path / "app"; app.mkdir(); (app / ".installed_version").write_text("a" * 40 + "\n")
+def fake_releases(monkeypatch, releases: list, compare_status: str = "behind"):
+    """GitHub's release list (newest first), commit lookup and compare API."""
+    def get(url, accept=""):
+        if "/releases?" in url:
+            return json.dumps(releases).encode()
+        if "/compare/" in url:
+            return json.dumps({"status": compare_status}).encode()
+        if "/commits/" in url:
+            return json.dumps({"commit": {"message": "Fix things\n\nmore"}}).encode()
+        raise AssertionError(url)
+    monkeypatch.setattr(updater, "_get", get)
+
+def release(n: int, sha: str, apk: bool = True) -> dict:
+    assets = [{"name": "SecureMediaProcessor-portable.zip", "browser_download_url": f"https://x/{n}.zip"}]
+    if apk:
+        assets.append({"name": "SecureMediaProcessor.apk", "browser_download_url": f"https://x/{n}.apk"})
+    return {"tag_name": f"1.0.{n}", "target_commitish": sha, "published_at": f"2026-11-{n:02d}T10:00:00Z",
+            "draft": False, "prerelease": False, "assets": assets}
+
+def installed_copy(tmp_path, monkeypatch, sha=None, name=None) -> Path:
+    app = tmp_path / "app"; app.mkdir()
+    if sha: (app / ".installed_version").write_text(sha + "\n")
+    if name: (app / ".release_version").write_text(name + "\n")
     point_updater_at(app, monkeypatch)
-    monkeypatch.setattr(updater, "ANDROID", True)
+    monkeypatch.setattr(updater, "RELEASE_FILE", app / ".release_version")
     monkeypatch.setattr(updater, "is_git_checkout", lambda: False)
-    release = {"target_commitish": "b" * 40, "published_at": "2026-11-12T10:00:00Z", "name": "1.0.7 (bbbbbbb)",
-               "assets": [{"name": "SecureMediaProcessor-portable.zip", "browser_download_url": "https://x/zip"},
-                          {"name": "SecureMediaProcessor.apk", "browser_download_url": "https://x/apk"}]}
-    monkeypatch.setattr(updater, "_get", lambda url, accept="": json.dumps(release).encode())
+    return app
+
+def test_version_shown_without_network(tmp_path, monkeypatch):
+    installed_copy(tmp_path, monkeypatch, sha="a" * 40, name="1.0.6")
+    monkeypatch.setattr(updater, "_get", lambda *a, **k: (_ for _ in ()).throw(AssertionError("went online")))
+    assert updater.describe_local() == "1.0.6"
+    (updater.RELEASE_FILE).unlink()
+    assert updater.describe_local() == "commit aaaaaaa"
+
+def test_update_check_reports_this_and_latest_version(tmp_path, monkeypatch):
+    installed_copy(tmp_path, monkeypatch, sha="a" * 40, name="1.0.6")
+    fake_releases(monkeypatch, [release(7, "b" * 40), release(6, "a" * 40)])
     info = updater.check()
-    assert info.local == "a" * 40 and info.remote == "b" * 40 and not info.up_to_date
-    assert info.download_url == "https://x/apk"
+    assert (info.local_name, info.remote_name, info.remote) == ("1.0.6", "1.0.7", "b" * 40)
+    assert not info.up_to_date and info.remote_message == "Fix things" and info.download_url == ""
+
+def test_update_check_up_to_date_and_newer_than_release(tmp_path, monkeypatch):
+    installed_copy(tmp_path, monkeypatch, sha="b" * 40)
+    fake_releases(monkeypatch, [release(7, "b" * 40), release(6, "a" * 40)])
+    info = updater.check()
+    assert info.up_to_date and not info.local_ahead and info.local_name == "1.0.7"   # name found from the list
+    monkeypatch.setattr(updater, "local_version", lambda: "c" * 40)          # a commit with no release yet
+    fake_releases(monkeypatch, [release(7, "b" * 40)], compare_status="ahead")
+    info = updater.check()
+    assert info.up_to_date and info.local_ahead
+    fake_releases(monkeypatch, [release(7, "b" * 40)], compare_status="behind")
+    assert not updater.check().up_to_date
+
+def test_snapshot_update_records_the_release_version(tmp_path, monkeypatch):
+    app = installed_copy(tmp_path, monkeypatch, sha="a" * 40, name="1.0.6")
+    fake_github(monkeypatch, {"app.py": b"x = 1\n"})
+    msg = updater.apply(updater.UpdateInfo("a" * 40, "COMMIT", "", "", remote_name="1.0.7"))
+    assert "1.0.7" in msg and updater.describe_local() == "1.0.7"
+    assert (app / ".installed_version").read_text().strip() == "COMMIT"
+
+def test_android_update_check_uses_latest_release_apk(tmp_path, monkeypatch):
+    installed_copy(tmp_path, monkeypatch, sha="a" * 40, name="1.0.6")
+    monkeypatch.setattr(updater, "ANDROID", True)
+    fake_releases(monkeypatch, [release(8, "c" * 40, apk=False), release(7, "b" * 40), release(6, "a" * 40)])
+    info = updater.check()                    # 1.0.8's Android build failed: the phone is offered 1.0.7
+    assert (info.local_name, info.remote_name) == ("1.0.6", "1.0.7") and not info.up_to_date
+    assert info.download_url == "https://x/7.apk"
     with pytest.raises(updater.UpdateError):          # code is never swapped inside the APK
         updater.apply(info)
-    release["assets"] = release["assets"][:1]          # a release whose Android build failed
-    with pytest.raises(updater.UpdateError, match="no Android app"):
+    fake_releases(monkeypatch, [release(8, "c" * 40, apk=False)])
+    with pytest.raises(updater.UpdateError, match="No release has an Android app"):
         updater.check()
 
 def test_commit_keeps_going_when_dates_cannot_be_set(tmp_path, monkeypatch):

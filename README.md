@@ -42,8 +42,8 @@ left as they are by that step (they are still stripped, padded and renamed). Re-
 are 5-20x larger and the encoding is slow on a phone. Logs are kept in the app's private storage unless you choose
 another log folder.
 
-**Updates**: **Check for updates** compares the app with the latest release and downloads the new APK; Android
-installs it over the old one and keeps your settings.
+**Updates**: **Check for updates** shows this version and the latest one and, if there is a newer one, downloads
+its APK; Android installs it over the old one and keeps your settings.
 
 ## Using the app
 
@@ -86,7 +86,9 @@ processed.
 
 ## Updates (PC)
 
-**Check for updates** in the app, or `python src/secure_media_processor.py --update`. The app only goes online when
+Every build is a numbered release (`1.0.<build>`). The app shows its own version in the top right (from the copy
+itself, no network); **Check for updates** shows it next to the latest release and whether an update is available.
+From the command line: `python src/secure_media_processor.py --update`. The app only goes online when
 you press Install or Update.
 
 - **In a git clone** (including the app in `dist\`): `git pull --ff-only`. It refuses to run over uncommitted changes.
