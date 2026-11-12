@@ -5,7 +5,8 @@ r"""
 ========================================================================
 Combines parallel_rename_clean_deduplicate_media_v7.py (perceptual-hash
 dedupe + tidy renaming; its hashing and similarity tests are copied verbatim,
-with a BK-Tree from fast_media_deduplicator.py to skip hopeless comparisons)
+with a BK-Tree to skip comparisons that cannot match - tested to give
+v7's exact decisions)
 and Media_processor.py (metadata strip + lossless re-encode) into one tool.
 
 It acts on every media file in the folder it is RUN FROM (the current
