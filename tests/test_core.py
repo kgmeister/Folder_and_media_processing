@@ -278,6 +278,35 @@ def test_updater_refuses_tampered_download(tmp_path, monkeypatch):
 def test_blob_sha_matches_git():
     assert updater._blob_sha(b"hello\n") == "ce013625030ba8dba906f756967f9e9ca394464a"    # git hash-object
 
+# ---------------------------------------------------------------- Android
+def test_android_update_check_uses_latest_release_apk(tmp_path, monkeypatch):
+    app = tmp_path / "app"; app.mkdir(); (app / ".installed_version").write_text("a" * 40 + "\n")
+    point_updater_at(app, monkeypatch)
+    monkeypatch.setattr(updater, "ANDROID", True)
+    monkeypatch.setattr(updater, "is_git_checkout", lambda: False)
+    release = {"target_commitish": "b" * 40, "published_at": "2026-11-12T10:00:00Z", "name": "1.0.7 (bbbbbbb)",
+               "assets": [{"name": "SecureMediaProcessor-portable.zip", "browser_download_url": "https://x/zip"},
+                          {"name": "SecureMediaProcessor.apk", "browser_download_url": "https://x/apk"}]}
+    monkeypatch.setattr(updater, "_get", lambda url, accept="": json.dumps(release).encode())
+    info = updater.check()
+    assert info.local == "a" * 40 and info.remote == "b" * 40 and not info.up_to_date
+    assert info.download_url == "https://x/apk"
+    with pytest.raises(updater.UpdateError):          # code is never swapped inside the APK
+        updater.apply(info)
+    release["assets"] = release["assets"][:1]          # a release whose Android build failed
+    with pytest.raises(updater.UpdateError, match="no Android app"):
+        updater.check()
+
+def test_commit_keeps_going_when_dates_cannot_be_set(tmp_path, monkeypatch):
+    """Some phone storage refuses os.utime; the verified file must still replace the original."""
+    original = tmp_path / "a.png"; original.write_bytes(b"old")
+    tmp = tmp_path / "t.png"; tmp.write_bytes(b"new")
+    def refuse(*a, **k):
+        raise PermissionError("Operation not permitted")
+    monkeypatch.setattr(core.os, "utime", refuse)
+    core.commit(tmp, original, original, original.stat())
+    assert original.read_bytes() == b"new" and not tmp.exists()
+
 # ---------------------------------------------------------------- settings / tools installer
 def test_log_dir_setting(tmp_path, monkeypatch):
     monkeypatch.setattr(core, "SETTINGS_FILE", tmp_path / "settings.json")

@@ -2,7 +2,7 @@
 
 An offline tool that cleans a folder of photos, videos and audio before it goes anywhere near a cloud: it merges
 `@name` folders, strips metadata, removes duplicates, re-encodes losslessly, gives every file a unique content hash,
-and renames files after their folder. The desktop app and the command line run the same engine.
+and renames files after their folder. The PC app, the Android app and the command line run the same engine.
 
 ## Get it (Windows, portable)
 
@@ -26,6 +26,23 @@ SecureMediaProcessor\
 
 To remove it, delete the folder. The program that runs is Python's own `pythonw.exe`, signed by the Python Software
 Foundation, so it works with Windows 11 Smart App Control turned on.
+
+## Get it (Android)
+
+1. On the phone, open the latest
+   [release](https://github.com/kgmeister/Folder_and_media_processing/releases) and download
+   `SecureMediaProcessor.apk`.
+2. Open it and tap **Install** (the first time, Android asks you to allow installs from your browser).
+3. In the app, **Choose folder** asks for Android's **All files access**: turn it on, then come back. It is needed to
+   change photos in place in folders such as `DCIM` and `Pictures`.
+
+The phone version handles **photos only**: Android has no ffmpeg, so videos and audio are not stripped, padded,
+re-encoded or checked for duplicates (they are still merged and renamed), and JPEGs are not re-encoded (the
+optimiser is not available for Android). Duplicate detection, metadata stripping, unique hashes and renaming work
+exactly as on the PC. Logs are kept in the app's private storage unless you choose another log folder.
+
+**Updates**: **Check for updates** compares the app with the latest release and downloads the new APK; Android
+installs it over the old one and keeps your settings.
 
 ## Using the app
 
@@ -66,7 +83,7 @@ Saved to a folder you choose (**Run > Log folder > Change...**; the command line
 source. Logs list original file names and hashes, so the app warns when the log folder is inside the folder being
 processed.
 
-## Updates
+## Updates (PC)
 
 **Check for updates** in the app, or `python src/secure_media_processor.py --update`. The app only goes online when
 you press Install or Update.
@@ -88,6 +105,7 @@ python src/app.py [folder]              # desktop app
 python src/secure_media_processor.py    # command line, processes the current folder
 python -m pytest -q tests               # video tests are skipped when ffmpeg is not on PATH
 python scripts/make_portable.py         # rebuilds dist\SecureMediaProcessor; commit it with the code
+set SMP_MOBILE_PREVIEW=1 && python src/app.py   # the phone layout in a phone-sized window
 ```
 
 ```
@@ -107,10 +125,14 @@ legacy/                 the original standalone scripts the engine is built from
                         parallel_rename_clean_deduplicate_media_v7.py (duplicate detection) and
                         merge_folders_with_prefix.py (folder merge)
 dist/                   the built portable app
+pyproject.toml          Android build settings and libraries (flet build apk)
 requirements-dev.txt    src/requirements.txt + pytest
 ```
 
-## Android (planned)
+### Builds
 
-A sideloaded APK built from the same Python code with Flet (`flet build apk`), with an update button that downloads
-and installs the newest APK. Open item: running ffmpeg on Android.
+Every push to `main` runs `.github/workflows/build.yml`: tests, the portable Windows zip and the APK, published
+together as release `1.0.<run number>`. The APK is signed with one fixed key, because Android only installs an update
+signed with the same key as the installed app. The key is not in this repository; the build reads it from two
+GitHub Actions secrets, `ANDROID_KEYSTORE_BASE64` and `ANDROID_KEYSTORE_PASSWORD`. Without them the Android build
+stops with an error and the release contains only the Windows zip.

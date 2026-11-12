@@ -21,6 +21,7 @@ dist/*.zip
 
 # updater state of a source checkout (the portable app's own copy in dist/ IS committed)
 /.installed_version
+src/.installed_version
 /.installed_files
 .update_backup/
 
@@ -28,3 +29,9 @@ dist/*.zip
 tools/
 dist/SecureMediaProcessor/data/tools/
 build/
+
+# Android build (flet build apk) output, and the signing key if it is ever copied here: never commit it
+apk_out/
+*.p12
+*.jks
+*.keystore

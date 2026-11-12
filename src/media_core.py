@@ -30,9 +30,11 @@ match the original) before it replaces the original, and the original's
 modification time is kept so "oldest first" ordering stays correct.
 
 REQUIREMENTS:
-    pip install Pillow imagehash          (auto-installed if missing)
+    pip install Pillow imagehash          (auto-installed if missing, PC only)
     ffmpeg + ffprobe on PATH or in tools/ (video/audio steps, video dedupe)
     jpegtran: optional fallback; JPEGs use the bundled mozjpeg optimiser
+Android (APK): photos only. There is no ffmpeg (videos and audio are left
+untouched) and no mozjpeg (JPEGs are not re-encoded; everything else works).
 ========================================================================
 """
 import os, sys, shutil, tempfile, time, uuid, logging, importlib.util, threading
@@ -43,7 +45,12 @@ from dataclasses import dataclass
 from typing import Callable, Dict, List, Tuple, Optional, Union
 from concurrent.futures import Executor, ThreadPoolExecutor, ProcessPoolExecutor, as_completed
 
+# Android app (built with `flet build apk`): Flet sets FLET_PLATFORM; Python 3.13+ also reports sys.platform.
+ANDROID = os.environ.get("FLET_PLATFORM") == "android" or sys.platform == "android"
+
 def _ensure_packages():
+    if ANDROID:            # packages are baked into the APK; there is no pip on the phone
+        return
     need = {"PIL": "Pillow", "imagehash": "ImageHash", "mozjpeg_lossless_optimization": "mozjpeg-lossless-optimization"}
     missing = [pip for mod, pip in need.items() if importlib.util.find_spec(mod) is None]
     if missing:
@@ -106,8 +113,12 @@ LOG_NAME = "media_processor_log.txt"
 # Then settings, logs and ffmpeg all live in <folder>/data and nothing is written anywhere else on the PC.
 PORTABLE_ROOT = Path(__file__).resolve().parent.parent
 PORTABLE = (PORTABLE_ROOT / "runtime").is_dir() and (PORTABLE_ROOT / "data").is_dir()
-APP_DATA = (PORTABLE_ROOT / "data" if PORTABLE else
-            Path(os.environ.get("LOCALAPPDATA") or Path.home() / ".local" / "share") / "SecureMediaProcessor")
+if ANDROID:                # the app's private storage (Flet provides it); other apps cannot read it
+    APP_DATA = Path(os.environ.get("FLET_APP_STORAGE_DATA") or Path.home()) / "SecureMediaProcessor"
+elif PORTABLE:
+    APP_DATA = PORTABLE_ROOT / "data"
+else:
+    APP_DATA = Path(os.environ.get("LOCALAPPDATA") or Path.home() / ".local" / "share") / "SecureMediaProcessor"
 SETTINGS_FILE = APP_DATA / "settings.json"
 DEFAULT_LOG_DIR = APP_DATA / "logs"       # outside the processed folder: logs list original names and hashes
 TOOLS_DIR = APP_DATA / "tools"            # where the app installs ffmpeg/ffprobe
@@ -189,7 +200,10 @@ def free_name(p: Path) -> Path:
 
 def commit(tmp: Path, original: Path, final: Path, st: os.stat_result):
     """Move a verified temp file over the original, keeping the original's timestamps."""
-    os.utime(tmp, ns=(st.st_atime_ns, st.st_mtime_ns))
+    try:
+        os.utime(tmp, ns=(st.st_atime_ns, st.st_mtime_ns))
+    except OSError as e:   # some phone storage refuses to set times; the verified content still goes in
+        log.warning(f"Could not keep the original date of {original.name} ({e}); 'oldest first' may change")
     os.replace(tmp, final)
     if final != original:
         original.unlink()

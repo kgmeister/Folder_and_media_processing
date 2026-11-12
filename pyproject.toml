@@ -1,0 +1,38 @@
+# Android app: `flet build apk` (run by GitHub Actions, see .github/workflows/build.yml).
+# The PC app does not use this file; its libraries are in src/requirements.txt.
+
+[project]
+name = "secure-media-processor"
+version = "1.0.0"
+description = "Offline photo cleaner: strips metadata, removes duplicates, gives every file a unique hash"
+dependencies = [
+    "flet==1.1.2",
+    "flet-permission-handler==1.1.2",   # Android's "All files access" switch
+    "Pillow",
+    "ImageHash",                        # with numpy, scipy and PyWavelets, all built for Android by Flet
+]
+
+[tool.flet]
+# org + project name = the Android package id (io.github.kgmeister.secure_media_processor).
+# Never change it: Android only installs an update over an app with the same id and signing key.
+org = "io.github.kgmeister"
+product = "Secure Media Processor"
+company = "kgmeister"
+copyright = "kgmeister"
+
+[tool.flet.app]
+path = "src"
+module = "app"
+
+[tool.flet.android]
+target_arch = ["arm64-v8a"]             # every phone from the last ~8 years; keeps the APK small
+
+[tool.flet.android.permission]
+# Editing photos in place in shared folders (DCIM, Pictures, ...): "All files access" on Android 11+,
+# the classic storage permissions on Android 10 and older.
+"android.permission.MANAGE_EXTERNAL_STORAGE" = true
+"android.permission.READ_EXTERNAL_STORAGE" = true
+"android.permission.WRITE_EXTERNAL_STORAGE" = true
+
+[tool.flet.android.manifest_application]
+requestLegacyExternalStorage = true     # Android 10: real file paths in shared storage

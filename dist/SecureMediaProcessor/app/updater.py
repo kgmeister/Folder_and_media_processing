@@ -22,6 +22,9 @@ Install types:
     backs up the files it replaces to .update_backup/<time>/, then copies the new
     files in. Files deleted upstream are moved to the backup. In the portable
     app, if requirements.txt changed, the libraries in its runtime/ are updated.
+  * Android app: the newest APK is attached to the latest GitHub release. The
+    check compares the commit the APK was built from; installing it is done by
+    Android (the app opens the download, Android asks to install the update).
 """
 import hashlib, json, os, py_compile, shutil, subprocess, sys, tempfile, time, urllib.error, urllib.request
 from dataclasses import dataclass
@@ -31,6 +34,8 @@ from typing import Optional
 REPO = "kgmeister/Folder_and_media_processing"
 BRANCH = "main"
 APP_SUBDIR = "src"                                  # the repository folder an installed copy mirrors
+APK_ASSET = "SecureMediaProcessor.apk"              # release asset name of the Android app
+ANDROID = os.environ.get("FLET_PLATFORM") == "android" or sys.platform == "android"
 APP_DIR = Path(__file__).resolve().parent
 CONFIG_FILE = APP_DIR / "update_config.json"
 VERSION_FILE = APP_DIR / ".installed_version"      # plain-folder installs: commit sha now installed
@@ -49,6 +54,7 @@ class UpdateInfo:
     remote_date: str
     remote_message: str
     local_ahead: bool = False  # git checkout whose HEAD already contains the remote commit (unpushed work)
+    download_url: str = ""     # Android: the APK of the latest release
 
     @property
     def up_to_date(self) -> bool:
@@ -97,7 +103,19 @@ def local_version() -> Optional[str]:
     except OSError:
         return None
 
+def _check_release() -> UpdateInfo:
+    """Android: the latest release, created by CI with --target <commit sha>, carries the APK."""
+    data = json.loads(_get(f"https://api.github.com/repos/{REPO}/releases/latest"))
+    asset = next((a for a in data.get("assets", []) if a.get("name") == APK_ASSET), None)
+    if asset is None:
+        raise UpdateError("The latest release has no Android app (its build may still be running, or it failed). "
+                          "Try again later.")
+    return UpdateInfo(local_version(), data.get("target_commitish", ""), data.get("published_at", ""),
+                      data.get("name", ""), download_url=asset["browser_download_url"])
+
 def check() -> UpdateInfo:
+    if ANDROID:
+        return _check_release()
     data = json.loads(_get(f"https://api.github.com/repos/{REPO}/commits/{BRANCH}"))
     commit = data["commit"]
     local = local_version()
@@ -222,6 +240,8 @@ def _refresh_libraries(backup: Path) -> str:
 def apply(info: Optional[UpdateInfo] = None) -> str:
     """Install the latest version. Returns a message; raises UpdateError on failure.
     The running app keeps using the old code until it is restarted."""
+    if ANDROID:
+        raise UpdateError("On Android the update is the APK from the latest release; Android installs it.")
     if is_git_checkout():
         return _apply_git()
     return _apply_snapshot(info or check())

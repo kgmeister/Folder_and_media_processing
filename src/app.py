@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
 """
-Secure Media Processor - desktop app (Flet). Same engine as the command line
-(media_core.py), so both always process files identically.
+Secure Media Processor - the app (Flet), for the PC and as the Android APK. Same engine as the command line
+(media_core.py), so all of them process files identically.
 
     pip install -r src/requirements.txt
     python src/app.py
 
 Layout: 1. Folder  ->  2. Options  ->  3. Run (progress, log, cancel).
 The only network access is what you click: "Check for updates" and "Install ffmpeg".
+On a phone: one column, "All files access" is asked for before a folder can be chosen, photos only
+(no ffmpeg on Android), and "Check for updates" opens the newest APK for Android to install.
+SMP_MOBILE_PREVIEW=1 shows the phone layout in a phone-sized window on the PC.
 """
 import asyncio, collections, logging, os, sys, threading
 from pathlib import Path
@@ -58,10 +61,15 @@ def main(page: ft.Page):
     page.title = APP_TITLE
     page.theme = ft.Theme(color_scheme_seed=ft.Colors.TEAL)
     page.theme_mode = ft.ThemeMode.SYSTEM
-    page.padding = 16
-    page.window.width, page.window.height = 1000, 900
-    page.window.min_width, page.window.min_height = 720, 640
-    page.window.icon = str(ASSETS / "icon.ico")
+    on_android = page.platform == ft.PagePlatform.ANDROID
+    preview = os.environ.get("SMP_MOBILE_PREVIEW") == "1"
+    mobile = on_android or page.platform == ft.PagePlatform.IOS or preview
+    dlg_w = None if mobile else 480          # dialogs: fixed width on the PC, screen width on a phone
+    page.padding = 8 if mobile else 16
+    if not mobile or preview:
+        page.window.width, page.window.height = (412, 860) if preview else (1000, 900)
+        page.window.min_width, page.window.min_height = (360, 600) if preview else (720, 640)
+        page.window.icon = str(ASSETS / "icon.ico")
 
     log_handler = UiLogHandler()
     core.log.addHandler(log_handler)
@@ -70,13 +78,17 @@ def main(page: ft.Page):
              "log_dir": core.log_dir(), "tools": None}
 
     # ---------------- 1. Folder ----------------
-    folder_field = ft.TextField(label="Root folder", read_only=True, expand=True,
+    folder_field = ft.TextField(label="Root folder", read_only=True, expand=not mobile,
                                 hint_text="Choose the folder to process (all subfolders are included)")
     scan_text = ft.Text("No folder selected.", size=13)
     tools_text = ft.Text("", size=12, color=ft.Colors.ON_SURFACE_VARIANT, visible=False)
     warn_text = ft.Text("", size=13, color=ft.Colors.ERROR, weight=ft.FontWeight.W_600, visible=False)
 
     def describe_tools(t: core.Tools) -> str:
+        if on_android or preview:
+            return ("Phone version: photos only. Videos and audio are not stripped, padded, re-encoded or checked for "
+                    "duplicates (there is no ffmpeg on Android), only merged and renamed. JPEGs are not re-encoded. "
+                    "Everything else works as on the PC.")
         jpeg = ("built in" if core.mozjpeg_lossless is not None else
                 "jpegtran" if t.jpegtran else "MISSING (JPEGs are not re-encoded)")
         av = ("found" if (t.ffmpeg and t.ffprobe) else
@@ -88,7 +100,7 @@ def main(page: ft.Page):
         t = await asyncio.to_thread(core.find_tools)
         state["tools"] = t
         tools_text.value, tools_text.visible = describe_tools(t), True
-        install_btn.visible = tools_installer.supported() and not (t.ffmpeg and t.ffprobe)
+        install_btn.visible = tools_installer.supported() and not mobile and not (t.ffmpeg and t.ffprobe)
         page.update()
         return t
 
@@ -98,7 +110,7 @@ def main(page: ft.Page):
                       "from GitHub...")
         close = ft.TextButton("Close", on_click=lambda ev: page.pop_dialog(), disabled=True)
         page.show_dialog(ft.AlertDialog(modal=True, title=ft.Text("Installing ffmpeg"),
-                                        content=ft.Column([msg, bar], tight=True, width=480), actions=[close]))
+                                        content=ft.Column([msg, bar], tight=True, width=dlg_w), actions=[close]))
         progress = {"done": 0, "total": 0}
         job = asyncio.create_task(asyncio.to_thread(
             tools_installer.install_ffmpeg, lambda d, t: progress.update(done=d, total=t)))
@@ -123,7 +135,7 @@ def main(page: ft.Page):
     async def offer_ffmpeg():
         """Ask once at startup when ffmpeg is missing (downloading is never automatic: it is network access)."""
         t = await refresh_tools()
-        if t.ffmpeg and t.ffprobe or not tools_installer.supported():
+        if t.ffmpeg and t.ffprobe or not tools_installer.supported() or mobile:
             return
 
         async def yes(ev):
@@ -135,7 +147,7 @@ def main(page: ft.Page):
             content=ft.Text("Video and audio processing, and video duplicate detection, need ffmpeg.\n\n"
                             f"Download it now? About {tools_installer.APPROX_DOWNLOAD_MB} MB: the official gyan.dev "
                             f"release {tools_installer.VERSION} from GitHub, checked against its published checksum, "
-                            "installed only for this app (no admin rights, nothing added to the system).", width=480),
+                            "installed only for this app (no admin rights, nothing added to the system).", width=dlg_w),
             actions=[ft.TextButton("Not now", on_click=lambda ev: page.pop_dialog()),
                      ft.FilledButton("Download and install", icon=ft.Icons.DOWNLOAD, on_click=yes)]))
 
@@ -160,7 +172,51 @@ def main(page: ft.Page):
         show_error("Could not open the folder dialog", f"{error}")
         return None
 
+    perms = None
+    if on_android:
+        import flet_permission_handler as fph      # Android only; not needed (or installed) on the PC
+        perms = fph.PermissionHandler()
+
+    async def storage_allowed() -> bool:
+        """Android: editing files in place in shared folders (DCIM, Pictures, ...) needs 'All files access'."""
+        if perms is None:
+            return True
+        try:
+            if await perms.get_status(fph.Permission.MANAGE_EXTERNAL_STORAGE) == fph.PermissionStatus.GRANTED:
+                return True
+        except Exception as exc:        # noqa: BLE001
+            show_error("Could not check storage access", f"{exc}")
+            return False
+        result = {}
+
+        async def allow(ev):
+            page.pop_dialog()
+            try:      # opens Android's "All files access" switch for this app
+                result["status"] = await perms.request(fph.Permission.MANAGE_EXTERNAL_STORAGE)
+            except Exception as exc:    # noqa: BLE001
+                show_error("Could not ask for storage access", f"{exc}")
+            done.set()
+
+        def not_now(ev):
+            page.pop_dialog()
+            done.set()
+
+        done = asyncio.Event()
+        page.show_dialog(ft.AlertDialog(
+            modal=True, title=ft.Text("Allow access to your files"),
+            content=ft.Text("To clean photos in place, the app needs Android's 'All files access'. Android will show "
+                            "a switch: turn it on, then come back.\n\nThe app stays offline: it only reads and "
+                            "changes the files in the folder you choose.", width=dlg_w),
+            actions=[ft.TextButton("Not now", on_click=not_now),
+                     ft.FilledButton("Allow", icon=ft.Icons.LOCK_OPEN, on_click=allow)]))
+        await done.wait()
+        return result.get("status") == fph.PermissionStatus.GRANTED
+
     async def choose_folder(e):
+        if not await storage_allowed():
+            scan_text.value = "No access to your files yet: tap 'Choose folder' again to allow it."
+            page.update()
+            return
         path = await pick_directory("Choose the folder to process", state["root"])
         if path:
             await load_folder(Path(path))
@@ -174,7 +230,8 @@ def main(page: ft.Page):
         state["root"], state["scan"] = root, sc
         scan_text.value = (f"{sc.images:,} images · {sc.videos:,} videos · {sc.audio:,} audio files "
                            f"in {sc.folders:,} folder(s) · {sc.merge_pairs} '@' folder pair(s) to merge")
-        warn_text.value = "This is a drive root or your home folder - every media file below it will be processed."
+        warn_text.value = ("This is a whole storage root or your home folder - every media file below it will be "
+                           "processed.")
         warn_text.visible = sc.risky_root
         refresh()
 
@@ -183,17 +240,17 @@ def main(page: ft.Page):
 
     # ---------------- 2. Options ----------------
     cb_merge = ft.Checkbox(label="Folder merge", value=False)
-    prefix_field = ft.TextField(label="Folder name prefix (optional)", dense=True, width=420,
+    prefix_field = ft.TextField(label="Folder name prefix (optional)", dense=True, width=None if mobile else 420,
                                 disabled=True, tooltip="Added to the start of each top-level folder name")
     cb_strip = ft.Checkbox(label="Strip metadata", value=False)
     cb_dedupe = ft.Checkbox(label="Remove duplicates", value=False)
     cb_reencode = ft.Checkbox(label="Lossless re-encode", value=False)
     cb_unique = ft.Checkbox(label="Make every file's hash unique", value=True)
     cb_rename = ft.Checkbox(label="Rename files after their folder", value=False)
-    cb_hash = ft.Checkbox(label="Hash check: list any file whose content hash did NOT change", value=True,
-                          disabled=True)
+    cb_hash = ft.Checkbox(label="Hash check" if mobile else "Hash check: list any file whose content hash did NOT change",
+                          value=True, disabled=True)
 
-    num = lambda label, v: ft.TextField(label=label, value=str(v), width=150, dense=True,
+    num = lambda label, v: ft.TextField(label=label, value=str(v), width=140, dense=True,
                                         input_filter=ft.NumbersOnlyInputFilter())
     f_phash = num("pHash threshold", core.DEFAULT_PHASH_THRESHOLD)
     f_dimg = num("dHash (images)", core.DEFAULT_DHASH_THRESHOLD_IMG)
@@ -216,7 +273,10 @@ def main(page: ft.Page):
         option(cb_dedupe, "Perceptual hashing (pHash + dHash, Hamming distance) within each folder. The oldest copy "
                           f"is kept; duplicates move to '{core.DUP_DIRNAME}', unreadable files to "
                           f"'{core.CORRUPT_DIRNAME}'."),
-        option(cb_reencode, "Rewrites every file; decoded pixels/frames/samples stay bit-identical (verified). "
+        option(cb_reencode, "Rewrites PNG, GIF, TIFF and WebP; decoded pixels stay bit-identical (verified). PNG/GIF/"
+                            "TIFF about the same size, lossy WebP larger. JPEGs, videos and audio are not re-encoded on "
+                            "a phone." if mobile else
+                            "Rewrites every file; decoded pixels/frames/samples stay bit-identical (verified). "
                             "JPEG a few % smaller (built-in mozjpeg), PNG/GIF/TIFF about the same, lossy WebP larger. "
                             "VIDEO becomes FFV1 .mkv: typically 5-20x LARGER and slow.", badge("changes file hash")),
         option(cb_unique, "Adds 16 random bytes (OS cryptographic random generator, fresh for every file on every "
@@ -225,7 +285,8 @@ def main(page: ft.Page):
                           "run - ever produces the same file. No personal data is added.", badge("changes file hash")),
         option(cb_rename, "'<folder name> (N).<ext>', numbered 1..N oldest first per extension, no gaps. Removes "
                           "identifying original names such as IMG_20250101_123456.jpg."),
-        option(cb_hash, "SHA-256 of every file before and after the run. Reads every file twice."),
+        option(cb_hash, ("Lists any file whose content hash did NOT change. " if mobile else "")
+                        + "SHA-256 of every file before and after the run. Reads every file twice."),
         advanced,
     ], spacing=10)
 
@@ -234,12 +295,12 @@ def main(page: ft.Page):
     cancel_btn = ft.OutlinedButton("Cancel", icon=ft.Icons.STOP, disabled=True)
     step_text = ft.Text("Choose a folder and at least one option.", size=13)
     progress_bar = ft.ProgressBar(value=0, bar_height=8, border_radius=4)
-    log_view = ft.ListView(auto_scroll=True, spacing=1, height=300)
+    log_view = ft.ListView(auto_scroll=True, spacing=1, height=240 if mobile else 300)
     log_box = ft.Container(log_view, border=ft.Border.all(1, ft.Colors.OUTLINE_VARIANT), border_radius=8, padding=8)
     summary_col = ft.Column(spacing=2)
 
     # Log folder: chosen by the user, remembered for the app and the command line.
-    log_dir_text = ft.Text("", size=12, selectable=True, expand=True)
+    log_dir_text = ft.Text("", size=12, selectable=True, expand=not mobile)
     log_warn_text = ft.Text("", size=12, color=ft.Colors.ORANGE_800, visible=False)
 
     def show_log_dir():
@@ -397,7 +458,8 @@ def main(page: ft.Page):
                                 color=ft.Colors.ORANGE_800))
         body.append(ack)
         page.show_dialog(ft.AlertDialog(modal=True, title=ft.Text("Start processing?"),
-                                        content=ft.Column(body, tight=True, spacing=6, width=520),
+                                        content=ft.Column(body, tight=True, spacing=6, width=None if mobile else 520,
+                                                          scroll=ft.ScrollMode.AUTO),
                                         actions=[ft.TextButton("Back", on_click=lambda ev: page.pop_dialog()), go]))
 
     def cancel_job(e):
@@ -413,7 +475,7 @@ def main(page: ft.Page):
     async def check_updates(e):
         msg = ft.Text("Checking GitHub for the latest version...")
         actions = [ft.TextButton("Close", on_click=lambda ev: page.pop_dialog())]
-        dlg = ft.AlertDialog(modal=True, title=ft.Text("Updates"), content=ft.Column([msg], tight=True, width=480),
+        dlg = ft.AlertDialog(modal=True, title=ft.Text("Updates"), content=ft.Column([msg], tight=True, width=dlg_w),
                              actions=actions)
         page.show_dialog(dlg)
         try:
@@ -431,6 +493,17 @@ def main(page: ft.Page):
             return
         msg.value = (f"Installed: {installed}\nLatest:    {info.remote[:7]}  ({info.remote_date[:10]})\n"
                      f"{info.remote_message}")
+
+        if info.download_url:          # Android: Android itself installs the new APK
+            async def get_apk(ev):
+                await ft.UrlLauncher().launch_url(info.download_url, mode=ft.LaunchMode.EXTERNAL_APPLICATION)
+                msg.value += ("\n\nThe download has started in your browser. Open it when it finishes and tap "
+                              "Update. (The first time, Android asks you to allow installs from your browser.) "
+                              "Your settings are kept.")
+                page.update()
+            dlg.actions = [ft.FilledButton("Download update", icon=ft.Icons.DOWNLOAD, on_click=get_apk), *actions]
+            page.update()
+            return
 
         async def do_update(ev):
             install.disabled = True
@@ -453,22 +526,30 @@ def main(page: ft.Page):
 
     # ---------------- Layout ----------------
     version = updater.local_version()
-    header = ft.Row([ft.Image(src="icon.png", width=44, height=44),
-                     ft.Column([ft.Text(APP_TITLE, size=22, weight=ft.FontWeight.BOLD),
-                                ft.Text("Offline. Nothing leaves this computer unless you press Install or Update.",
-                                        size=12, color=ft.Colors.ON_SURFACE_VARIANT)], spacing=0, expand=True),
-                     ft.Text(f"version {version[:7]}" if version else "", size=12,
-                             color=ft.Colors.ON_SURFACE_VARIANT),
-                     update_btn])
-    page.add(ft.Column([
+    device = "phone" if mobile else "computer"
+    title_col = ft.Column([ft.Text(APP_TITLE, size=20 if mobile else 22, weight=ft.FontWeight.BOLD),
+                           ft.Text(f"Offline. Nothing leaves this {device} unless you press Install or Update.",
+                                   size=12, color=ft.Colors.ON_SURFACE_VARIANT)], spacing=0, expand=True)
+    version_text = ft.Text(f"version {version[:7]}" if version else "", size=12, color=ft.Colors.ON_SURFACE_VARIANT)
+    icon = ft.Image(src="icon.png", width=40 if mobile else 44, height=40 if mobile else 44)
+    if mobile:      # narrow screen: stack what sits side by side on the PC
+        header = ft.Column([ft.Row([icon, title_col]), ft.Row([version_text, update_btn],
+                                                              alignment=ft.MainAxisAlignment.SPACE_BETWEEN)], spacing=2)
+        folder_row = ft.Column([folder_field, choose_btn], spacing=8)
+        log_row = ft.Column([log_dir_text, ft.Row([log_change_btn, log_reset_btn])], spacing=0)
+    else:
+        header = ft.Row([icon, title_col, version_text, update_btn])
+        folder_row = ft.Row([folder_field, choose_btn])
+        log_row = ft.Row([log_dir_text, log_change_btn, log_reset_btn])
+    page.add(ft.SafeArea(ft.Column([
         header,
-        section(1, "Folder", ft.Column([ft.Row([folder_field, choose_btn]), scan_text,
+        section(1, "Folder", ft.Column([folder_row, scan_text,
                                         ft.Row([tools_text, install_btn], wrap=True), warn_text], spacing=6)),
         section(2, "Options", options_col),
-        section(3, "Run", ft.Column([ft.Row([log_dir_text, log_change_btn, log_reset_btn]), log_warn_text,
+        section(3, "Run", ft.Column([log_row, log_warn_text,
                                      ft.Row([start_btn, cancel_btn]), step_text, progress_bar, log_box, summary_col],
                                     spacing=8)),
-    ], spacing=12, scroll=ft.ScrollMode.AUTO, expand=True))
+    ], spacing=12, scroll=ft.ScrollMode.AUTO, expand=True), expand=True))
     refresh()
     page.run_task(offer_ffmpeg)
     # Optional: `python app.py "D:\folder"` opens with that folder already selected.

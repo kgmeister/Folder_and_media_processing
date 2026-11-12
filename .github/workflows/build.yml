@@ -1,0 +1,120 @@
+# On every push to main: test, build the portable Windows app and the Android APK, and publish both as the
+# latest GitHub release "1.0.<run number>". The apps' "Check for updates" reads that release.
+# Do not rename this file: the run number restarts for a renamed workflow, and the APK's build number comes
+# from it (Android refuses an "update" with a lower build number).
+name: Build
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write          # needed to create the release
+
+concurrency:
+  group: build
+  cancel-in-progress: false
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: python -m pip install -r requirements-dev.txt
+
+      - name: Run tests
+        run: python -m pytest -q tests
+
+      - name: Build portable app
+        run: python scripts/make_portable.py --zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: dist/SecureMediaProcessor-portable.zip
+          if-no-files-found: error
+
+  android:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Flet build tools
+        run: python -m pip install "flet==1.1.2" "flet-cli==1.1.2"
+
+      - name: Signing key
+        env:
+          KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+        run: |
+          if [ -z "$KEYSTORE_BASE64" ] || [ -z "$KEYSTORE_PASSWORD" ]; then
+            echo "::error::Secrets ANDROID_KEYSTORE_BASE64 and ANDROID_KEYSTORE_PASSWORD are not set. Every APK must be signed with the same key, or Android refuses to install it as an update."
+            exit 1
+          fi
+          echo "$KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/upload-keystore.p12"
+
+      - name: Record the version for "Check for updates"
+        run: echo "$GITHUB_SHA" > src/.installed_version
+
+      - name: Build APK
+        env:
+          FLET_ANDROID_SIGNING_KEY_STORE: ${{ runner.temp }}/upload-keystore.p12
+          FLET_ANDROID_SIGNING_KEY_STORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          FLET_ANDROID_SIGNING_KEY_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          FLET_ANDROID_SIGNING_KEY_ALIAS: upload
+        run: flet build apk --yes -v --build-number "$GITHUB_RUN_NUMBER" --build-version "1.0.$GITHUB_RUN_NUMBER" -o apk_out
+
+      - name: Name the APK
+        run: |
+          ls -la apk_out
+          apk=$(ls apk_out/*.apk | head -n 1)
+          test -n "$apk"
+          mv "$apk" SecureMediaProcessor.apk
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: android
+          path: SecureMediaProcessor.apk
+          if-no-files-found: error
+
+  release:
+    needs: [windows, android]
+    # Publish when the Windows build worked; the APK is attached when its build worked too.
+    if: ${{ always() && needs.windows.result == 'success' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ANDROID_RESULT: ${{ needs.android.result }}
+        run: |
+          files=(artifacts/windows/SecureMediaProcessor-portable.zip)
+          note="Android: SecureMediaProcessor.apk (photos only)."
+          if [ -f artifacts/android/SecureMediaProcessor.apk ]; then
+            files+=(artifacts/android/SecureMediaProcessor.apk)
+          else
+            note="Android: no APK in this build (Android build: $ANDROID_RESULT)."
+          fi
+          gh release create "1.0.${GITHUB_RUN_NUMBER}" "${files[@]}" \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "1.0.${GITHUB_RUN_NUMBER} (${GITHUB_SHA::7})" \
+            --notes "Windows: SecureMediaProcessor-portable.zip. Before unzipping: right-click the zip > Properties > tick Unblock, then unzip anywhere and double-click 'Secure Media Processor.cmd'.
+          ${note} Install it on the phone; later updates come from 'Check for updates' in the app.
+          commit: ${GITHUB_SHA}" \
+            --latest
