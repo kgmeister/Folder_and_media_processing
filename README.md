@@ -62,7 +62,7 @@ python -m pytest -q tests      # video tests are skipped when ffmpeg is not on P
 - `media_core.py`: processing engine used by both
 - `updater.py`: manual updater
 - `parallel_rename_clean_deduplicate_media_v7.py`: the original, tested dedupe script (reference)
-- `Media_processor.py`, `merge_folders_with_prefix.py`: the original scripts the engine was built from
+- `merge_folders_with_prefix.py`: the original folder merge script (reference)
 
 ## Android (planned)
 

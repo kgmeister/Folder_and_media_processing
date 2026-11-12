@@ -9,7 +9,7 @@ Entry point: run_pipeline(root, Options(...), progress, cancel).
 Combines parallel_rename_clean_deduplicate_media_v7.py (perceptual-hash
 dedupe + tidy renaming; its hashing and similarity tests are copied verbatim,
 with a BK-Tree to skip comparisons that cannot match - tested to give v7's
-exact decisions), Media_processor.py (metadata strip + lossless re-encode)
+exact decisions), the metadata strip + lossless re-encode script
 and merge_folders_with_prefix.py (folder merge) into one engine.
 
 Steps (fixed order, each optional):
