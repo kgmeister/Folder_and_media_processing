@@ -26,6 +26,10 @@ module = "app"
 
 [tool.flet.android]
 target_arch = ["arm64-v8a"]             # every phone from the last ~8 years; keeps the APK small
+# Native libraries are extracted to disk at install. Needed for ffmpeg/ffprobe: the build ships them as
+# libsmp_ffmpeg.so / libsmp_ffprobe.so (scripts/android_ffmpeg_wheel.py), and Android only runs programs
+# from that extracted native-library folder. (The build adds the ffmpeg wheel to `dependencies` here.)
+legacy_packaging = true
 
 [tool.flet.android.permission]
 # Editing photos in place in shared folders (DCIM, Pictures, ...): "All files access" on Android 11+,

@@ -279,6 +279,58 @@ def test_blob_sha_matches_git():
     assert updater._blob_sha(b"hello\n") == "ce013625030ba8dba906f756967f9e9ca394464a"    # git hash-object
 
 # ---------------------------------------------------------------- Android
+def load_wheel_script():
+    spec = importlib.util.spec_from_file_location("afw", ROOT / "scripts" / "android_ffmpeg_wheel.py")
+    mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod)
+    return mod
+
+def test_android_ffmpeg_wheel_installs_as_flet_would(tmp_path):
+    """The wheel must carry the binaries as plain lib*.so (Flet moves those to the APK's native-library folder),
+    under the names media_core looks for, and pip must accept it for Flet's Android target."""
+    afw = load_wheel_script()
+    assert afw.FILES == core.ANDROID_TOOL_FILES
+    bins = tmp_path / "bin"; bins.mkdir()
+    (bins / "ffmpeg").write_bytes(b"\x7fELF ffmpeg"); (bins / "ffprobe").write_bytes(b"\x7fELF ffprobe")
+    wheel = afw.build_wheel(bins, tmp_path / "wheels")
+    target = tmp_path / "site-packages"
+    r = subprocess.run([sys.executable, "-m", "pip", "install", "--disable-pip-version-check", "-q", "--no-deps",
+                        "--target", str(target), "--only-binary=:all:", "--platform", "android_24_arm64_v8a",
+                        "--python-version", "3.14", "--implementation", "cp",
+                        f"smp-android-ffmpeg @ {wheel.as_uri()}"], capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+    pkg = target / "smp_android_ffmpeg"
+    assert (pkg / "libsmp_ffmpeg.so").read_bytes() == b"\x7fELF ffmpeg"
+    assert (pkg / "libsmp_ffprobe.so").read_bytes() == b"\x7fELF ffprobe"
+
+def test_android_ffmpeg_wheel_is_added_to_pyproject(tmp_path):
+    import tomllib
+    afw = load_wheel_script()
+    pp = tmp_path / "pyproject.toml"
+    shutil.copy(ROOT / "pyproject.toml", pp)
+    wheel = tmp_path / "w" / "smp_android_ffmpeg-8.0.1-py3-none-android_24_arm64_v8a.whl"
+    afw.add_to_pyproject(pp, wheel); afw.add_to_pyproject(pp, wheel)          # idempotent
+    android = tomllib.loads(pp.read_text())["tool"]["flet"]["android"]
+    assert android["dependencies"] == [f"smp-android-ffmpeg @ {wheel.resolve().as_uri()}"]
+    assert android["legacy_packaging"] is True and android["target_arch"] == ["arm64-v8a"]
+
+def test_android_finds_bundled_ffmpeg(tmp_path, monkeypatch):
+    libdir = tmp_path / "data" / "app" / "pkg-1" / "lib" / "arm64"; libdir.mkdir(parents=True)
+    for f in ("libpython3.14.so", "libsmp_ffmpeg.so", "libsmp_ffprobe.so"):
+        (libdir / f).write_bytes(b"x")
+    maps = tmp_path / "maps"
+    maps.write_text("7000000000-7000001000 r-xp 00000000 fd:05 1234   /system/lib64/libc.so\n"
+                    "7000002000-7000003000 r--p 00000000 00:00 0 \n"
+                    f"7000004000-7000005000 r-xp 00000000 fd:05 99   {(libdir / 'libpython3.14.so').as_posix()}\n")
+    assert core.android_native_lib_dir(maps) == libdir
+    monkeypatch.setattr(core, "ANDROID", True)
+    monkeypatch.setattr(core, "android_native_lib_dir", lambda: libdir)
+    monkeypatch.setattr(core, "tool_runs", lambda exe: (True, ""))
+    t = core.find_tools()
+    assert t.ffmpeg == str(libdir / "libsmp_ffmpeg.so") and t.ffprobe == str(libdir / "libsmp_ffprobe.so")
+    monkeypatch.setattr(core, "tool_runs", lambda exe: (False, "would not start."))
+    t = core.find_tools()                                    # present but not runnable -> treated as missing
+    assert t.ffmpeg is None and t.ffprobe is None and t.blocked == ("ffmpeg", "ffprobe")
+
 def test_android_update_check_uses_latest_release_apk(tmp_path, monkeypatch):
     app = tmp_path / "app"; app.mkdir(); (app / ".installed_version").write_text("a" * 40 + "\n")
     point_updater_at(app, monkeypatch)

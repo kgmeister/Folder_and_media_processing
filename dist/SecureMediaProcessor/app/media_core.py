@@ -33,8 +33,9 @@ REQUIREMENTS:
     pip install Pillow imagehash          (auto-installed if missing, PC only)
     ffmpeg + ffprobe on PATH or in tools/ (video/audio steps, video dedupe)
     jpegtran: optional fallback; JPEGs use the bundled mozjpeg optimiser
-Android (APK): photos only. There is no ffmpeg (videos and audio are left
-untouched) and no mozjpeg (JPEGs are not re-encoded; everything else works).
+Android (APK): ffmpeg/ffprobe are built for Android and shipped inside the
+APK (scripts/build_android_ffmpeg.sh), so videos and audio work as on the PC.
+There is no mozjpeg for Android: JPEGs are not re-encoded (everything else works).
 ========================================================================
 """
 import os, sys, shutil, tempfile, time, uuid, logging, importlib.util, threading
@@ -119,6 +120,12 @@ elif PORTABLE:
     APP_DATA = PORTABLE_ROOT / "data"
 else:
     APP_DATA = Path(os.environ.get("LOCALAPPDATA") or Path.home() / ".local" / "share") / "SecureMediaProcessor"
+if ANDROID and os.environ.get("FLET_APP_STORAGE_TEMP"):   # Android has no /tmp (v7's video frame folders go here)
+    Path(os.environ["FLET_APP_STORAGE_TEMP"]).mkdir(parents=True, exist_ok=True)
+    tempfile.tempdir = os.environ["FLET_APP_STORAGE_TEMP"]
+# Android: ffmpeg/ffprobe ship inside the APK as native libraries (scripts/android_ffmpeg_wheel.py), because
+# Android only runs programs from the folder it extracts those to.
+ANDROID_TOOL_FILES = {"ffmpeg": "libsmp_ffmpeg.so", "ffprobe": "libsmp_ffprobe.so"}
 SETTINGS_FILE = APP_DATA / "settings.json"
 DEFAULT_LOG_DIR = APP_DATA / "logs"       # outside the processed folder: logs list original names and hashes
 TOOLS_DIR = APP_DATA / "tools"            # where the app installs ffmpeg/ffprobe
@@ -1168,10 +1175,32 @@ def tool_runs(exe: str) -> Tuple[bool, str]:
             _RUN_CHECKS[exe] = (False, f"{Path(exe).name} did not respond.")
     return _RUN_CHECKS[exe]
 
+def android_native_lib_dir(maps: Path = Path("/proc/self/maps")) -> Optional[Path]:
+    """Android: the folder the APK's native libraries were extracted to, found through the loaded libpython."""
+    try:
+        for line in maps.read_text(errors="replace").splitlines():
+            parts = line.split(maxsplit=5)
+            if len(parts) == 6 and "/libpython3" in parts[5] and parts[5].endswith(".so") and "!" not in parts[5]:
+                return Path(parts[5].strip()).parent
+    except OSError:
+        pass
+    return None
+
 def find_tools() -> Tools:
     """PATH lookup, after putting the tools folders first on PATH: a 'tools' folder next to the exe or the
     script, and the per-user folder the app installs ffmpeg into. Changing PATH (not just remembering paths)
-    means worker processes and v7's hashing code find them too."""
+    means worker processes and v7's hashing code find them too. Android: the copies shipped in the APK."""
+    if ANDROID:
+        lib_dir = android_native_lib_dir()
+        found, blocked = {}, []
+        for name, lib in ANDROID_TOOL_FILES.items():
+            exe = str(lib_dir / lib) if lib_dir is not None and (lib_dir / lib).is_file() else None
+            if exe and not tool_runs(exe)[0]:
+                log.warning(tool_runs(exe)[1] + " Treated as missing.")
+                blocked.append(name)
+                exe = None
+            found[name] = exe
+        return Tools(found["ffmpeg"], found["ffprobe"], None, tuple(blocked))
     for d in (Path(sys.executable).resolve().parent / "tools", Path(__file__).resolve().parent / "tools", TOOLS_DIR):
         if d.is_dir() and str(d) not in os.environ.get("PATH", "").split(os.pathsep):
             os.environ["PATH"] = str(d) + os.pathsep + os.environ.get("PATH", "")

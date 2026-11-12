@@ -36,10 +36,11 @@ Foundation, so it works with Windows 11 Smart App Control turned on.
 3. In the app, **Choose folder** asks for Android's **All files access**: turn it on, then come back. It is needed to
    change photos in place in folders such as `DCIM` and `Pictures`.
 
-The phone version handles **photos only**: Android has no ffmpeg, so videos and audio are not stripped, padded,
-re-encoded or checked for duplicates (they are still merged and renamed), and JPEGs are not re-encoded (the
-optimiser is not available for Android). Duplicate detection, metadata stripping, unique hashes and renaming work
-exactly as on the PC. Logs are kept in the app's private storage unless you choose another log folder.
+The phone version does everything the PC version does, for photos, videos and audio: it has its own ffmpeg, built
+into the APK. The one exception is re-encoding JPEGs: the JPEG optimiser does not exist for Android, so JPEGs are
+left as they are by that step (they are still stripped, padded and renamed). Re-encoding videos works, but FFV1 files
+are 5-20x larger and the encoding is slow on a phone. Logs are kept in the app's private storage unless you choose
+another log folder.
 
 **Updates**: **Check for updates** compares the app with the latest release and downloads the new APK; Android
 installs it over the old one and keeps your settings.
@@ -120,6 +121,7 @@ src/                    the app (copied as-is to the portable app's app\ folder)
 scripts/
   make_portable.py      builds dist\SecureMediaProcessor
   make_icon.py          draws the owl icon into src/assets/
+  build_android_ffmpeg.sh, android_ffmpeg_wheel.py   ffmpeg for the APK (run by the build)
 tests/                  pytest suite
 legacy/                 the original standalone scripts the engine is built from (reference only):
                         parallel_rename_clean_deduplicate_media_v7.py (duplicate detection) and
@@ -136,3 +138,8 @@ together as release `1.0.<run number>`. The APK is signed with one fixed key, be
 signed with the same key as the installed app. The key is not in this repository; the build reads it from two
 GitHub Actions secrets, `ANDROID_KEYSTORE_BASE64` and `ANDROID_KEYSTORE_PASSWORD`. Without them the Android build
 stops with an error and the release contains only the Windows zip.
+
+The APK's ffmpeg is compiled from the official ffmpeg 8.0.1 source by `scripts/build_android_ffmpeg.sh` (checksum
+pinned; only ffmpeg's own codecs, LGPL) and cached between builds. Android only runs programs from the folder it
+extracts an app's native libraries to, so `scripts/android_ffmpeg_wheel.py` ships ffmpeg and ffprobe as
+`libsmp_ffmpeg.so` / `libsmp_ffprobe.so` in a small package the APK build installs, and the app finds them there.

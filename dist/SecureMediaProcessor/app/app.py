@@ -86,9 +86,11 @@ def main(page: ft.Page):
 
     def describe_tools(t: core.Tools) -> str:
         if on_android or preview:
-            return ("Phone version: photos only. Videos and audio are not stripped, padded, re-encoded or checked for "
-                    "duplicates (there is no ffmpeg on Android), only merged and renamed. JPEGs are not re-encoded. "
-                    "Everything else works as on the PC.")
+            if t.ffmpeg and t.ffprobe:
+                return ("ffmpeg: built in · Photos, videos and audio are processed as on the PC. Only JPEG "
+                        "re-encoding is not available on a phone (its optimiser does not exist for Android).")
+            return ("ffmpeg: NOT WORKING on this phone" + (" (it would not start)" if t.blocked else "") + ". Videos "
+                    "and audio are only merged and renamed; photos are processed as usual.")
         jpeg = ("built in" if core.mozjpeg_lossless is not None else
                 "jpegtran" if t.jpegtran else "MISSING (JPEGs are not re-encoded)")
         av = ("found" if (t.ffmpeg and t.ffprobe) else
@@ -273,9 +275,9 @@ def main(page: ft.Page):
         option(cb_dedupe, "Perceptual hashing (pHash + dHash, Hamming distance) within each folder. The oldest copy "
                           f"is kept; duplicates move to '{core.DUP_DIRNAME}', unreadable files to "
                           f"'{core.CORRUPT_DIRNAME}'."),
-        option(cb_reencode, "Rewrites PNG, GIF, TIFF and WebP; decoded pixels stay bit-identical (verified). PNG/GIF/"
-                            "TIFF about the same size, lossy WebP larger. JPEGs, videos and audio are not re-encoded on "
-                            "a phone." if mobile else
+        option(cb_reencode, "Rewrites every file except JPEGs (not available on a phone); decoded pixels/frames/samples "
+                            "stay bit-identical (verified). PNG/GIF/TIFF about the same size, lossy WebP larger. VIDEO "
+                            "becomes FFV1 .mkv: typically 5-20x LARGER, and slow on a phone." if mobile else
                             "Rewrites every file; decoded pixels/frames/samples stay bit-identical (verified). "
                             "JPEG a few % smaller (built-in mozjpeg), PNG/GIF/TIFF about the same, lossy WebP larger. "
                             "VIDEO becomes FFV1 .mkv: typically 5-20x LARGER and slow.", badge("changes file hash")),

@@ -64,6 +64,22 @@ jobs:
           fi
           echo "$KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/upload-keystore.p12"
 
+      # ffmpeg/ffprobe for Android: compiled from the official source once (~10 min), then reused from the cache
+      # until scripts/build_android_ffmpeg.sh changes.
+      - name: Cache Android ffmpeg
+        id: ffmpeg-cache
+        uses: actions/cache@v6
+        with:
+          path: android-ffmpeg
+          key: android-ffmpeg-${{ hashFiles('scripts/build_android_ffmpeg.sh') }}
+
+      - name: Build ffmpeg for Android
+        if: steps.ffmpeg-cache.outputs.cache-hit != 'true'
+        run: bash scripts/build_android_ffmpeg.sh android-ffmpeg
+
+      - name: Package ffmpeg for the APK
+        run: python scripts/android_ffmpeg_wheel.py android-ffmpeg android-ffmpeg-wheel --add-to-pyproject
+
       - name: Record the version for "Check for updates"
         run: echo "$GITHUB_SHA" > src/.installed_version
 
@@ -81,6 +97,11 @@ jobs:
           apk=$(ls apk_out/*.apk | head -n 1)
           test -n "$apk"
           mv "$apk" SecureMediaProcessor.apk
+
+      - name: Check that ffmpeg is in the APK
+        run: |
+          unzip -l SecureMediaProcessor.apk | grep -E "lib/arm64-v8a/libsmp_(ffmpeg|ffprobe)\.so" || true
+          test "$(unzip -l SecureMediaProcessor.apk | grep -cE 'lib/arm64-v8a/libsmp_(ffmpeg|ffprobe)\.so')" -eq 2
 
       - uses: actions/upload-artifact@v7
         with:

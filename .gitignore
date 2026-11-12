@@ -32,6 +32,8 @@ build/
 
 # Android build (flet build apk) output, and the signing key if it is ever copied here: never commit it
 apk_out/
+android-ffmpeg/
+android-ffmpeg-wheel/
 *.p12
 *.jks
 *.keystore
