@@ -11,7 +11,11 @@ The PC version is **portable**: one folder, nothing installed, nothing written o
 1. Download `SecureMediaProcessor-portable.zip` from the latest
    [release](https://github.com/kgmeister/Folder_and_media_processing/releases) (built on every push to `main`),
    or build it yourself with `python make_portable.py` (output in `dist\SecureMediaProcessor`).
-2. Unzip it anywhere: another drive, a USB stick, any folder.
+   Or `git clone` this repository: the ready-to-run app is committed in `dist\SecureMediaProcessor`.
+2. **Downloaded zip only:** right-click it > Properties > tick **Unblock** > OK, *then* unzip it anywhere (another
+   drive, a USB stick, any folder). Otherwise Windows marks every extracted file as "from the internet" and Smart App
+   Control blocks the launcher ("files of this type from the internet can be dangerous"). Already unzipped? Run
+   `Get-ChildItem -Recurse <folder> | Unblock-File` in PowerShell. A `git clone` is never marked.
 3. Double-click **Secure Media Processor.cmd** (a console window flashes for a moment, then the app opens).
 
 ```

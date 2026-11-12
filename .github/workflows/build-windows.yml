@@ -42,5 +42,5 @@ jobs:
           gh release create "build-${GITHUB_RUN_NUMBER}" dist/SecureMediaProcessor-portable.zip \
             --target "$GITHUB_SHA" \
             --title "Build ${GITHUB_RUN_NUMBER} (${short})" \
-            --notes "Portable app for Windows. Unzip anywhere, then double-click 'Secure Media Processor.cmd'. commit: ${GITHUB_SHA}" \
+            --notes "Portable app for Windows. Before unzipping: right-click the zip > Properties > tick Unblock (otherwise Smart App Control blocks it). Unzip anywhere, then double-click 'Secure Media Processor.cmd'. commit: ${GITHUB_SHA}" \
             --latest
