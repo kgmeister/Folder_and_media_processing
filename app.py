@@ -162,8 +162,8 @@ def main(page: ft.Page):
 
     # ---------------- 2. Options ----------------
     cb_merge = ft.Checkbox(label="Folder merge", value=False)
-    prefix_field = ft.TextField(label="Prefix for top-level folder names (optional)", dense=True, width=330,
-                                disabled=True)
+    prefix_field = ft.TextField(label="Folder name prefix (optional)", dense=True, width=420,
+                                disabled=True, tooltip="Added to the start of each top-level folder name")
     cb_strip = ft.Checkbox(label="Strip metadata", value=False)
     cb_dedupe = ft.Checkbox(label="Remove duplicates", value=False)
     cb_reencode = ft.Checkbox(label="Lossless re-encode", value=False)
