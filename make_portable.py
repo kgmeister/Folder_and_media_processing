@@ -70,6 +70,9 @@ def main() -> int:
     # back to pure Python without them; removing them avoids a "Part of this app has been blocked" pop-up.
     for f in (OUT / "runtime" / "Lib" / "site-packages" / "msgpack").glob("_cmsgpack*.pyd"):
         f.unlink()
+    # pip's console-script launchers (pip.exe, flet.exe, ...): never used (everything runs as python -m), unsigned,
+    # and regenerated with new bytes on every build, which would add ~1 MB of noise to the repo per rebuild.
+    shutil.rmtree(OUT / "runtime" / "Lib" / "site-packages" / "bin", ignore_errors=True)
 
     for rel in APP_FILES:
         shutil.copy2(ROOT / rel, OUT / "app" / rel)
