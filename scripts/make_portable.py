@@ -3,12 +3,12 @@ r"""
 Builds the portable Windows app: a folder you copy anywhere (another drive, a USB stick) and double-click.
 Nothing is installed, and nothing is written outside the folder.
 
-    python make_portable.py          -> dist\SecureMediaProcessor\
-    python make_portable.py --zip    -> also dist\SecureMediaProcessor-portable.zip
+    python scripts/make_portable.py          -> dist\SecureMediaProcessor\
+    python scripts/make_portable.py --zip    -> also dist\SecureMediaProcessor-portable.zip
 
 Layout:
     Secure Media Processor.cmd   double-click to start
-    app\                         the app's code and icon
+    app\                         the app: a copy of the repository's src\ folder
     runtime\                     a private copy of this Python (official python.org files, signed by the
                                  Python Software Foundation) plus the libraries the app needs
     data\                        settings, logs and ffmpeg: everything the app writes
@@ -20,10 +20,9 @@ Build it with the same Python version you want inside (3.12 here); the libraries
 import argparse, shutil, subprocess, sys, time
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent
+ROOT = Path(__file__).resolve().parents[1]
+SRC = ROOT / "src"                     # the app; copied as-is to app\ (the updater mirrors the same folder)
 OUT = ROOT / "dist" / "SecureMediaProcessor"
-APP_FILES = ["app.py", "media_core.py", "secure_media_processor.py", "updater.py", "tools_installer.py",
-             "requirements.txt", "README.md", "assets/icon.ico", "assets/icon.png"]
 # Parts of the Python install the app never uses (GUI toolkit, tests, IDE, docs, the build machine's packages).
 SKIP_TOP = {"Scripts", "Doc", "Tools", "tcl", "include", "libs", "share", "NEWS.txt"}
 SKIP_LIB = {"site-packages", "test", "idlelib", "tkinter", "turtledemo", "__pycache__", "ensurepip", "lib2to3"}
@@ -55,14 +54,13 @@ def main() -> int:
     args = ap.parse_args()
     if OUT.exists():
         shutil.rmtree(OUT)
-    (OUT / "runtime").mkdir(parents=True); (OUT / "data").mkdir(); (OUT / "app" / "assets").mkdir(parents=True)
+    (OUT / "runtime").mkdir(parents=True); (OUT / "data").mkdir()
 
     print(f"Copying Python {sys.version.split()[0]} from {sys.base_prefix} ...")
     copy_runtime(OUT / "runtime")
 
     print("Installing the app's libraries into runtime\\Lib\\site-packages ...")
-    reqs = [l for l in (ROOT / "requirements.txt").read_text().splitlines()
-            if l.strip() and not l.startswith("#") and not l.startswith("pytest")]
+    reqs = [l for l in (SRC / "requirements.txt").read_text().splitlines() if l.strip() and not l.startswith("#")]
     subprocess.run([sys.executable, "-m", "pip", "install", "--disable-pip-version-check", "-q", "--only-binary=:all:",
                     "--target", str(OUT / "runtime" / "Lib" / "site-packages"), "pip", *reqs], check=True)
 
@@ -72,14 +70,22 @@ def main() -> int:
         f.unlink()
     # pip's console-script launchers (pip.exe, flet.exe, ...): never used (everything runs as python -m), unsigned,
     # and regenerated with new bytes on every build, which would add ~1 MB of noise to the repo per rebuild.
-    shutil.rmtree(OUT / "runtime" / "Lib" / "site-packages" / "bin", ignore_errors=True)
+    site = OUT / "runtime" / "Lib" / "site-packages"
+    shutil.rmtree(site / "bin", ignore_errors=True)
+    for record in site.glob("*.dist-info/RECORD"):        # and drop them from pip's file lists, so a rebuild is identical
+        lines = record.read_bytes().decode("utf-8").splitlines(keepends=True)
+        record.write_bytes("".join(l for l in lines if not l.startswith("../../bin/")).encode("utf-8"))
 
-    for rel in APP_FILES:
-        shutil.copy2(ROOT / rel, OUT / "app" / rel)
+    tracked = subprocess.run(["git", "-C", str(SRC), "ls-files", "-z", "."], capture_output=True, text=True).stdout
+    app_files = sorted(f for f in tracked.split("\0") if f) or sorted(
+        p.relative_to(SRC).as_posix() for p in SRC.rglob("*") if p.is_file() and "__pycache__" not in p.parts)
+    for rel in app_files:                  # only committed files: never a local update_config.json or cache
+        (OUT / "app" / rel).parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(SRC / rel, OUT / "app" / rel)
     commit = subprocess.run(["git", "-C", str(ROOT), "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
     if commit:
         (OUT / "app" / ".installed_version").write_text(commit + "\n", encoding="utf-8")    # for "Check for updates"
-    (OUT / "app" / ".installed_files").write_text("\n".join(APP_FILES) + "\n", encoding="utf-8")
+    (OUT / "app" / ".installed_files").write_text("\n".join(app_files) + "\n", encoding="utf-8")
     (OUT / "Secure Media Processor.cmd").write_text(LAUNCHER, encoding="ascii")
     (OUT / "data" / "README.txt").write_text("Settings, run logs and the app's ffmpeg are kept here.\n", encoding="ascii")
 

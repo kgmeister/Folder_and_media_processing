@@ -996,7 +996,10 @@ def pad_av(path: Path, ffmpeg: str) -> Tuple[str, str]:
         cmd = [ffmpeg, "-nostdin", "-v", "error", "-y", "-i", str(path), "-map", "0", "-c", "copy",
                "-metadata", f"padding={_nonce().hex()}"]
         if path.suffix.lower() in (".mp4", ".m4v", ".m4a", ".mov", ".3gp"):
-            cmd += ["-movflags", "+use_metadata_tags"]
+            # use_metadata_tags would also write ffmpeg's read-back of the file-type header as tags, adding another
+            # copy on every pass (+26 bytes each time); clear them; the header itself still carries this information.
+            cmd += ["-metadata", "major_brand=", "-metadata", "minor_version=", "-metadata", "compatible_brands=",
+                    "-movflags", "+use_metadata_tags"]
         r = run_cmd(cmd + [str(tmp)], timeout=3600)
         if r.returncode != 0 or not tmp.exists() or tmp.stat().st_size == 0:
             return "failed", f"ffmpeg failed: {r.stderr.decode('utf-8', 'replace').strip()[-300:]}; original kept"

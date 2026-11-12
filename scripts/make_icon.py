@@ -1,4 +1,4 @@
-"""Draws the app icon (an owl) into icon.png and icon.ico. Run: python assets/make_icon.py"""
+"""Draws the app icon (an owl) into icon.png and icon.ico. Run: python scripts/make_icon.py (writes src/assets/)"""
 from pathlib import Path
 from PIL import Image, ImageDraw
 
@@ -37,7 +37,7 @@ def draw() -> Image.Image:
     return im
 
 if __name__ == "__main__":
-    out = Path(__file__).resolve().parent
+    out = Path(__file__).resolve().parents[1] / "src" / "assets"
     im = draw()
     im.resize((512, 512), Image.LANCZOS).save(out / "icon.png")
     im.save(out / "icon.ico", sizes=[(16, 16), (24, 24), (32, 32), (48, 48), (64, 64), (128, 128), (256, 256)])

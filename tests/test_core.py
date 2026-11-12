@@ -9,7 +9,7 @@ import pytest
 from PIL import Image, ImageDraw, PngImagePlugin
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(ROOT / "src"))
 import media_core as core   # noqa: E402
 import updater              # noqa: E402
 
@@ -17,7 +17,7 @@ HAVE_FFMPEG = bool(shutil.which("ffmpeg") and shutil.which("ffprobe"))
 needs_ffmpeg = pytest.mark.skipif(not HAVE_FFMPEG, reason="ffmpeg/ffprobe not on PATH")
 
 def load_v7():
-    spec = importlib.util.spec_from_file_location("v7", ROOT / "parallel_rename_clean_deduplicate_media_v7.py")
+    spec = importlib.util.spec_from_file_location("v7", ROOT / "legacy" / "parallel_rename_clean_deduplicate_media_v7.py")
     mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod)
     return mod
 
@@ -222,40 +222,61 @@ def test_video_strip_and_padding(tmp_path):
     assert status == "changed" and clip.read_bytes() != once and len(clip.read_bytes()) == len(once)
 
 # ---------------------------------------------------------------- updater
+def fake_github(monkeypatch, files: dict, tamper: str = ""):
+    """Serve `files` ({path under src/: bytes}) the way GitHub's tree API and raw file host would."""
+    blobs = {p: updater._blob_sha(d) for p, d in files.items()}
+    def get(url, accept=""):
+        if url.endswith("/git/trees/COMMIT"):
+            return json.dumps({"tree": [{"path": "src", "type": "tree", "sha": "SRCTREE"},
+                                        {"path": "dist", "type": "tree", "sha": "DIST"}]}).encode()
+        if "/git/trees/SRCTREE" in url:
+            return json.dumps({"tree": [{"path": p, "type": "blob", "sha": b} for p, b in blobs.items()]}).encode()
+        assert url.startswith("https://raw.githubusercontent.com/") and "/COMMIT/src/" in url, url
+        rel = url.split("/COMMIT/src/", 1)[1]
+        return files[rel] + (b"tampered" if rel == tamper else b"")
+    monkeypatch.setattr(updater, "_get", get)
+
+def point_updater_at(app: Path, monkeypatch):
+    for name, value in (("APP_DIR", app), ("CONFIG_FILE", app / "update_config.json"),
+                        ("VERSION_FILE", app / ".installed_version"), ("MANIFEST_FILE", app / ".installed_files"),
+                        ("BACKUP_DIR", app / ".update_backup")):
+        monkeypatch.setattr(updater, name, value)
+
 def test_updater_snapshot_install(tmp_path, monkeypatch):
     app = tmp_path / "app"; app.mkdir()
     (app / "media_core.py").write_text("OLD = 1\n"); (app / "gone.py").write_text("x = 1\n")
     (app / "update_config.json").write_text(json.dumps({"github_token": ""}))
     (app / ".installed_files").write_text("media_core.py\ngone.py\n")
-    buf = io.BytesIO()
-    with zipfile.ZipFile(buf, "w") as zf:
-        zf.writestr("repo-abc123/media_core.py", "NEW = 2\n")
-        zf.writestr("repo-abc123/app.py", "print('hi')\n")
-        zf.writestr("repo-abc123/update_config.json", "{\"github_token\": \"FROM-REPO\"}")
-    for name, value in (("APP_DIR", app), ("CONFIG_FILE", app / "update_config.json"),
-                        ("VERSION_FILE", app / ".installed_version"), ("MANIFEST_FILE", app / ".installed_files"),
-                        ("BACKUP_DIR", app / ".update_backup")):
-        monkeypatch.setattr(updater, name, value)
-    monkeypatch.setattr(updater, "_get", lambda url, accept="": buf.getvalue())
-    msg = updater.apply(updater.UpdateInfo(None, "abc123" * 6, "2026-11-12", "test"))
+    point_updater_at(app, monkeypatch)
+    fake_github(monkeypatch, {"media_core.py": b"NEW = 2\n", "app.py": b"print('hi')\n", "assets/icon.png": b"PNG",
+                              "update_config.json": b'{"github_token": "FROM-REPO"}'})
+    msg = updater.apply(updater.UpdateInfo(None, "COMMIT", "2026-11-12", "test"))
     assert (app / "media_core.py").read_text() == "NEW = 2\n" and (app / "app.py").exists()
+    assert (app / "assets" / "icon.png").read_bytes() == b"PNG"               # subfolders of src/ too
+    assert not (app / "dist").exists()                                      # nothing outside src/ is fetched
     assert not (app / "gone.py").exists()                                   # deleted upstream -> backed up
     assert "FROM-REPO" not in (app / "update_config.json").read_text()      # local config never replaced
     assert list((app / ".update_backup").rglob("gone.py")) and "Installed" in msg
+    assert (app / ".installed_version").read_text().strip() == "COMMIT"
 
 def test_updater_refuses_broken_snapshot(tmp_path, monkeypatch):
     app = tmp_path / "app"; app.mkdir(); (app / "media_core.py").write_text("OLD = 1\n")
-    buf = io.BytesIO()
-    with zipfile.ZipFile(buf, "w") as zf:
-        zf.writestr("repo-x/media_core.py", "def broken(:\n")
-    for name, value in (("APP_DIR", app), ("CONFIG_FILE", app / "update_config.json"),
-                        ("VERSION_FILE", app / ".installed_version"), ("MANIFEST_FILE", app / ".installed_files"),
-                        ("BACKUP_DIR", app / ".update_backup")):
-        monkeypatch.setattr(updater, name, value)
-    monkeypatch.setattr(updater, "_get", lambda url, accept="": buf.getvalue())
+    point_updater_at(app, monkeypatch)
+    fake_github(monkeypatch, {"media_core.py": b"def broken(:\n"})
     with pytest.raises(updater.UpdateError):
-        updater.apply(updater.UpdateInfo(None, "f" * 40, "", ""))
+        updater.apply(updater.UpdateInfo(None, "COMMIT", "", ""))
     assert (app / "media_core.py").read_text() == "OLD = 1\n"
+
+def test_updater_refuses_tampered_download(tmp_path, monkeypatch):
+    app = tmp_path / "app"; app.mkdir(); (app / "media_core.py").write_text("OLD = 1\n")
+    point_updater_at(app, monkeypatch)
+    fake_github(monkeypatch, {"media_core.py": b"NEW = 2\n", "app.py": b"x = 1\n"}, tamper="app.py")
+    with pytest.raises(updater.UpdateError, match="hash"):
+        updater.apply(updater.UpdateInfo(None, "COMMIT", "", ""))
+    assert (app / "media_core.py").read_text() == "OLD = 1\n" and not (app / "app.py").exists()
+
+def test_blob_sha_matches_git():
+    assert updater._blob_sha(b"hello\n") == "ce013625030ba8dba906f756967f9e9ca394464a"    # git hash-object
 
 # ---------------------------------------------------------------- settings / tools installer
 def test_log_dir_setting(tmp_path, monkeypatch):

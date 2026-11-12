@@ -1,0 +1,3 @@
+# For development: the app's libraries plus the test runner.  pip install -r requirements-dev.txt
+-r src/requirements.txt
+pytest

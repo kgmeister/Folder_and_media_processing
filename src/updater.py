@@ -12,22 +12,25 @@ private, put a read-only GitHub token in update_config.json next to this file:
 That file is git-ignored, so the token is never committed or pushed.
 
 Install types:
-  * portable app (make_portable.py): the app/ folder is updated like a plain
-    folder (below); if requirements.txt changed, the libraries in its own
-    runtime/ are updated too.
-  * git checkout (a .git folder next to this file): `git pull --ff-only`.
-    Refuses to run over uncommitted changes and never rewrites local commits.
-  * plain folder: downloads the latest snapshot, checks that every .py file
-    compiles, backs up the files it replaces to .update_backup/<time>/, then
-    copies the new files in. Files deleted upstream are moved to the backup.
+  * git checkout (this file is tracked in a clone of the repository; this also
+    covers the portable app committed under dist/): `git pull --ff-only` of the
+    whole clone. Refuses to run over uncommitted changes, never rewrites local
+    commits.
+  * plain folder, e.g. the portable app from the release zip: downloads only the
+    repository's src/ folder (the app; the folder this file lives in mirrors it),
+    checks each file against GitHub's hash and that every .py file compiles,
+    backs up the files it replaces to .update_backup/<time>/, then copies the new
+    files in. Files deleted upstream are moved to the backup. In the portable
+    app, if requirements.txt changed, the libraries in its runtime/ are updated.
 """
-import json, os, py_compile, shutil, subprocess, sys, tempfile, time, urllib.error, urllib.request, zipfile
+import hashlib, json, os, py_compile, shutil, subprocess, sys, tempfile, time, urllib.error, urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
 REPO = "kgmeister/Folder_and_media_processing"
 BRANCH = "main"
+APP_SUBDIR = "src"                                  # the repository folder an installed copy mirrors
 APP_DIR = Path(__file__).resolve().parent
 CONFIG_FILE = APP_DIR / "update_config.json"
 VERSION_FILE = APP_DIR / ".installed_version"      # plain-folder installs: commit sha now installed
@@ -77,7 +80,13 @@ def _git(*args: str) -> subprocess.CompletedProcess:
     return subprocess.run(["git", "-C", str(APP_DIR), *args], capture_output=True, text=True, timeout=300)
 
 def is_git_checkout() -> bool:
-    return (APP_DIR / ".git").exists() and shutil.which("git") is not None
+    """True when this file is tracked in a git clone of the repository (not just any folder inside some repo)."""
+    if shutil.which("git") is None:
+        return False
+    try:
+        return _git("ls-files", "--error-unmatch", Path(__file__).name).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
 
 def local_version() -> Optional[str]:
     if is_git_checkout():
@@ -116,19 +125,44 @@ def _apply_git() -> str:
     after = local_version()
     return "Already up to date." if before == after else f"Updated {before[:7]} -> {after[:7]}."
 
+def _app_tree(sha: str) -> dict:
+    """{relative path: git blob sha} of every file in the repository's APP_SUBDIR at commit `sha` (2 API calls)."""
+    api = f"https://api.github.com/repos/{REPO}/git/trees"
+    root = json.loads(_get(f"{api}/{sha}"))
+    sub = next((e for e in root.get("tree", []) if e["path"] == APP_SUBDIR and e["type"] == "tree"), None)
+    if sub is None:
+        raise UpdateError(f"The latest version has no {APP_SUBDIR}/ folder; download it again from GitHub instead.")
+    tree = json.loads(_get(f"{api}/{sub['sha']}?recursive=1"))
+    if tree.get("truncated"):
+        raise UpdateError("GitHub returned an incomplete file list; nothing was changed.")
+    return {e["path"]: e["sha"] for e in tree["tree"] if e["type"] == "blob"}
+
+def _blob_sha(data: bytes) -> str:
+    """The id git gives a file's content; GitHub lists it for every file, so a download can be checked against it."""
+    return hashlib.sha1(b"blob %d\0" % len(data) + data).hexdigest()
+
+def _download_app(sha: str, dest: Path) -> list:
+    """Download the app files (raw file host: not counted against the API's 60 requests/hour)."""
+    files = []
+    for rel, blob in sorted(_app_tree(sha).items()):
+        rel = Path(rel)
+        if rel.is_absolute() or ".." in rel.parts or rel.parts[0] in PRESERVE:
+            continue
+        data = _get(f"https://raw.githubusercontent.com/{REPO}/{sha}/{APP_SUBDIR}/{rel.as_posix()}", "*/*")
+        if _blob_sha(data) != blob:
+            raise UpdateError(f"Downloaded {rel} does not match GitHub's hash; nothing was changed.")
+        (dest / rel).parent.mkdir(parents=True, exist_ok=True)
+        (dest / rel).write_bytes(data)
+        files.append(rel)
+    if not files:
+        raise UpdateError("The latest version contains no app files; nothing was changed.")
+    return files
+
 def _apply_snapshot(info: UpdateInfo) -> str:
     with tempfile.TemporaryDirectory(prefix="smp_update_") as tmp:
         tmp = Path(tmp)
-        archive = tmp / "update.zip"
-        archive.write_bytes(_get(f"https://api.github.com/repos/{REPO}/zipball/{info.remote}", "application/vnd.github+json"))
-        with zipfile.ZipFile(archive) as zf:
-            zf.extractall(tmp / "x")                     # zipfile drops absolute paths and '..' parts
-        tops = [p for p in (tmp / "x").iterdir() if p.is_dir()]
-        if len(tops) != 1:
-            raise UpdateError("Unexpected archive layout from GitHub")
-        new_root = tops[0]
-        new_files = sorted(p.relative_to(new_root) for p in new_root.rglob("*")
-                           if p.is_file() and p.relative_to(new_root).parts[0] not in PRESERVE)
+        new_root = tmp / "new"
+        new_files = _download_app(info.remote, new_root)
         for rel in new_files:                            # refuse a snapshot that doesn't even compile
             if rel.suffix == ".py":
                 try:

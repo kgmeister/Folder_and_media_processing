@@ -1,9 +1,8 @@
 app.py
-media_core.py
-secure_media_processor.py
-updater.py
-tools_installer.py
-requirements.txt
-README.md
 assets/icon.ico
 assets/icon.png
+media_core.py
+requirements.txt
+secure_media_processor.py
+tools_installer.py
+updater.py

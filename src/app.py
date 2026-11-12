@@ -3,8 +3,8 @@
 Secure Media Processor - desktop app (Flet). Same engine as the command line
 (media_core.py), so both always process files identically.
 
-    pip install -r requirements.txt
-    python app.py
+    pip install -r src/requirements.txt
+    python src/app.py
 
 Layout: 1. Folder  ->  2. Options  ->  3. Run (progress, log, cancel).
 The only network access is what you click: "Check for updates" and "Install ffmpeg".
