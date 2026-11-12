@@ -39,7 +39,9 @@ ANDROID = os.environ.get("FLET_PLATFORM") == "android" or sys.platform == "andro
 APP_DIR = Path(__file__).resolve().parent
 CONFIG_FILE = APP_DIR / "update_config.json"
 VERSION_FILE = APP_DIR / ".installed_version"      # plain-folder installs: commit sha now installed
-RELEASE_FILE = APP_DIR / ".release_version"        # zip / APK / updated copies: release name, e.g. "1.0.7"
+RELEASE_FILE = APP_DIR / ".release_version"        # zip / updated copies: release name, e.g. "1.0.7"
+# APK: Flet's packager leaves out files whose names start with ".", so the Android build writes this instead.
+BUILD_INFO_FILE = APP_DIR / "build_info.json"      # {"version": "1.0.7", "commit": "<sha>"}
 MANIFEST_FILE = APP_DIR / ".installed_files"       # plain-folder installs: files the last update wrote
 BACKUP_DIR = APP_DIR / ".update_backup"
 # Never touched by an update: local config/state, bundled binaries, logs, git internals.
@@ -98,21 +100,29 @@ def is_git_checkout() -> bool:
     except (OSError, subprocess.SubprocessError):
         return False
 
+def _build_info() -> dict:
+    try:
+        data = json.loads(BUILD_INFO_FILE.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
 def local_version() -> Optional[str]:
+    """Commit this copy was made from: git, else the file the build/updater wrote."""
     if is_git_checkout():
         r = _git("rev-parse", "HEAD")
         return r.stdout.strip() if r.returncode == 0 else None
     try:
         return VERSION_FILE.read_text(encoding="utf-8").strip() or None
     except OSError:
-        return None
+        return _build_info().get("commit") or None
 
 def local_release_name() -> Optional[str]:
     """This copy's release version ("1.0.7"), written by the build into the zip and the APK, and by updates."""
     try:
         return RELEASE_FILE.read_text(encoding="utf-8").strip() or None
     except OSError:
-        return None
+        return _build_info().get("version") or None
 
 def describe_local() -> str:
     """This copy's version for display, without going online."""

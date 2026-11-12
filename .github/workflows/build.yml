@@ -82,10 +82,11 @@ jobs:
       - name: Package ffmpeg for the APK
         run: python scripts/android_ffmpeg_wheel.py android-ffmpeg android-ffmpeg-wheel --add-to-pyproject
 
+      # Not a ".file": Flet's packager leaves those out of the APK.
       - name: Record the version for "Check for updates"
         run: |
-          echo "$GITHUB_SHA" > src/.installed_version
-          echo "1.0.$GITHUB_RUN_NUMBER" > src/.release_version
+          echo "{\"version\": \"1.0.$GITHUB_RUN_NUMBER\", \"commit\": \"$GITHUB_SHA\"}" > src/build_info.json
+          cat src/build_info.json
 
       - name: Build APK
         env:
@@ -102,10 +103,12 @@ jobs:
           test -n "$apk"
           mv "$apk" SecureMediaProcessor.apk
 
-      - name: Check that ffmpeg is in the APK
+      - name: Check that ffmpeg and the version are in the APK
         run: |
           unzip -l SecureMediaProcessor.apk | grep -E "lib/arm64-v8a/libsmp_(ffmpeg|ffprobe)\.so" || true
           test "$(unzip -l SecureMediaProcessor.apk | grep -cE 'lib/arm64-v8a/libsmp_(ffmpeg|ffprobe)\.so')" -eq 2
+          unzip -p SecureMediaProcessor.apk assets/app.zip > app.zip
+          unzip -p app.zip build_info.json | tee /dev/stderr | grep -q "\"1.0.$GITHUB_RUN_NUMBER\""
 
       - uses: actions/upload-artifact@v7
         with:

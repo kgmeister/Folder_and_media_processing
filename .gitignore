@@ -23,6 +23,7 @@ dist/*.zip
 /.installed_version
 src/.installed_version
 src/.release_version
+src/build_info.json
 /.release_version
 /.installed_files
 .update_backup/

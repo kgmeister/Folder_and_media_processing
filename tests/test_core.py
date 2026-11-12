@@ -366,6 +366,17 @@ def test_version_shown_without_network(tmp_path, monkeypatch):
     (updater.RELEASE_FILE).unlink()
     assert updater.describe_local() == "commit aaaaaaa"
 
+def test_apk_version_comes_from_build_info(tmp_path, monkeypatch):
+    """Flet's packager drops '.files' from the APK, so the Android build writes build_info.json."""
+    app = installed_copy(tmp_path, monkeypatch)
+    monkeypatch.setattr(updater, "BUILD_INFO_FILE", app / "build_info.json")
+    assert updater.describe_local() == "unknown"
+    (app / "build_info.json").write_text(json.dumps({"version": "1.0.4", "commit": "d" * 40}))
+    assert updater.describe_local() == "1.0.4" and updater.local_version() == "d" * 40
+    fake_releases(monkeypatch, [release(4, "d" * 40)])
+    info = updater.check()
+    assert info.up_to_date and info.local_name == "1.0.4"
+
 def test_update_check_reports_this_and_latest_version(tmp_path, monkeypatch):
     installed_copy(tmp_path, monkeypatch, sha="a" * 40, name="1.0.6")
     fake_releases(monkeypatch, [release(7, "b" * 40), release(6, "a" * 40)])
