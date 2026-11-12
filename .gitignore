@@ -3,3 +3,15 @@ __pycache__/
 media_processor_log.txt
 dedup_log.txt
 folder_merge_log.txt
+
+# updater: local token and install state - never commit (the token would be published)
+update_config.json
+.installed_version
+.installed_files
+.update_backup/
+
+# optional bundled binaries (ffmpeg.exe, ffprobe.exe, jpegtran.exe)
+tools/
+
+.pytest_cache/
+build/
