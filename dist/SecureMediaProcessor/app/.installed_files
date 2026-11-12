@@ -1,0 +1,9 @@
+app.py
+media_core.py
+secure_media_processor.py
+updater.py
+tools_installer.py
+requirements.txt
+README.md
+assets/icon.ico
+assets/icon.png

@@ -1,20 +1,30 @@
-__pycache__/
-*.pyc
+# Everything is committed, including the built portable app in dist/, so a clone is a complete,
+# ready-to-run copy. Only the items below stay out of the (public) repository.
+
+# updater token - would be published, never commit it
+update_config.json
+
+# logs: they list original file names and hashes of the processed media
 media_processor_log.txt
 dedup_log.txt
 folder_merge_log.txt
+logs/
+dist/SecureMediaProcessor/data/logs/
 
-# updater: local token and install state - never commit (the token would be published)
-update_config.json
-.installed_version
-.installed_files
+# Python caches (recreated automatically)
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# the release zip is just dist/SecureMediaProcessor zipped (CI publishes it)
+dist/*.zip
+
+# updater state of a source checkout (the portable app's own copy in dist/ IS committed)
+/.installed_version
+/.installed_files
 .update_backup/
 
-# optional bundled binaries (ffmpeg.exe, ffprobe.exe, jpegtran.exe)
+# ffmpeg downloaded by "Install ffmpeg" (~200 MB; one click on each machine)
 tools/
-
-.pytest_cache/
+dist/SecureMediaProcessor/data/tools/
 build/
-
-# build output (python make_portable.py)
-dist/

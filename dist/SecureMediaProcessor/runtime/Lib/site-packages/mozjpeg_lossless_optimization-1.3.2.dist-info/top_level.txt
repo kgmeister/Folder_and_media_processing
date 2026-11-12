@@ -1,0 +1,1 @@
+mozjpeg_lossless_optimization

@@ -1,0 +1,3 @@
+# The portable app is stored byte-for-byte: no line-ending conversion, so every machine
+# gets exactly the files that were built (the .cmd launcher, Python's RECORD hashes, etc.).
+dist/** -text -diff
