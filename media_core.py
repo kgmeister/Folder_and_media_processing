@@ -18,9 +18,10 @@ Steps (fixed order, each optional):
                           tags, chapters, cover art, telemetry streams
   3. Deduplication      - p-hash/d-hash + Hamming distance, per folder;
                           duplicates -> "Duplicates", unreadable -> "Corrupted"
-  4. Lossless re-encode - pixel/sample-exact; if that can't change the bytes,
-                          16 random padding bytes are added instead
-  5. Renaming           - "<folder name> (N).<ext>", oldest first, no gaps
+  4. Lossless re-encode - pixel/sample-exact (JPEG via mozjpeg, video FFV1)
+  5. Unique padding     - 16 random bytes per file, so no two people (or runs)
+                          ever produce the same hash
+  6. Renaming           - "<folder name> (N).<ext>", oldest first, no gaps
   Optional hash check: sha256 of every file before and after, unchanged
   files are listed.
 
@@ -31,28 +32,52 @@ modification time is kept so "oldest first" ordering stays correct.
 REQUIREMENTS:
     pip install Pillow imagehash          (auto-installed if missing)
     ffmpeg + ffprobe on PATH or in tools/ (video/audio steps, video dedupe)
-    jpegtran on PATH or in tools/         (JPEG lossless re-encode)
+    jpegtran: optional fallback; JPEGs use the bundled mozjpeg optimiser
 ========================================================================
 """
-import os, sys, shutil, tempfile, subprocess, time, uuid, logging, importlib.util, threading
-import io, struct, zlib, hashlib
+import os, sys, shutil, tempfile, time, uuid, logging, importlib.util, threading
+import subprocess as _subprocess
+import io, json, struct, zlib, hashlib
 from pathlib import Path
 from dataclasses import dataclass
 from typing import Callable, Dict, List, Tuple, Optional, Union
 from concurrent.futures import Executor, ThreadPoolExecutor, ProcessPoolExecutor, as_completed
 
 def _ensure_packages():
-    need = {"PIL": "Pillow", "imagehash": "ImageHash"}
+    if getattr(sys, "frozen", False):      # packaged app: everything is bundled, and there is no pip
+        return
+    need = {"PIL": "Pillow", "imagehash": "ImageHash", "mozjpeg_lossless_optimization": "mozjpeg-lossless-optimization"}
     missing = [pip for mod, pip in need.items() if importlib.util.find_spec(mod) is None]
     if missing:
         print(f"[setup] Auto-installing required packages: {', '.join(missing)}", file=sys.stderr)
-        try: subprocess.run([sys.executable, "-m", "pip", "install", "--upgrade", *missing], check=True)
-        except subprocess.CalledProcessError:
-            subprocess.run([sys.executable, "-m", "pip", "install", "--user", "--upgrade", *missing], check=True)
+        try: _subprocess.run([sys.executable, "-m", "pip", "install", "--upgrade", *missing], check=True)
+        except _subprocess.CalledProcessError:
+            _subprocess.run([sys.executable, "-m", "pip", "install", "--user", "--upgrade", *missing], check=True)
 
 _ensure_packages()
 from PIL import Image, ImageOps, ImageFile, PngImagePlugin
 import imagehash
+try:    # lossless JPEG optimiser (mozjpeg); bundled with the app, so jpegtran is only a fallback
+    import mozjpeg_lossless_optimization as mozjpeg_lossless
+except ImportError:
+    mozjpeg_lossless = None
+
+# ffmpeg/ffprobe are console programs: launched from the windowed app on Windows, each call would flash a
+# console window. On Windows, `subprocess` in this module is a shim that adds CREATE_NO_WINDOW to every call,
+# including the verbatim v7 functions, which call subprocess.run / subprocess.check_output directly.
+class _NoConsoleSubprocess:
+    def __getattr__(self, name):
+        return getattr(_subprocess, name)
+
+    def run(self, *args, **kwargs):
+        kwargs.setdefault("creationflags", _subprocess.CREATE_NO_WINDOW)
+        return _subprocess.run(*args, **kwargs)
+
+    def check_output(self, *args, **kwargs):
+        kwargs.setdefault("creationflags", _subprocess.CREATE_NO_WINDOW)
+        return _subprocess.check_output(*args, **kwargs)
+
+subprocess = _NoConsoleSubprocess() if os.name == "nt" else _subprocess
 
 # Pillow configuration
 ImageFile.LOAD_TRUNCATED_IMAGES = True
@@ -79,6 +104,10 @@ CORRUPT_DIRNAME = "Corrupted"
 SKIP_DIRNAMES = (DUP_DIRNAME, CORRUPT_DIRNAME)
 TMP_PREFIX = ".mp_tmp_"          # in-progress output files; swept on startup
 LOG_NAME = "media_processor_log.txt"
+APP_DATA = Path(os.environ.get("LOCALAPPDATA") or Path.home() / ".local" / "share") / "SecureMediaProcessor"
+SETTINGS_FILE = APP_DATA / "settings.json"
+DEFAULT_LOG_DIR = APP_DATA / "logs"       # outside the processed folder: logs list original names and hashes
+TOOLS_DIR = APP_DATA / "tools"            # where the app installs ffmpeg/ffprobe
 VIDEO_REENCODE_MIN_FREE_FACTOR = 10   # need 10x the source size free before an FFV1 encode
 
 # Logger: the CLI and the GUI attach their own handlers
@@ -727,18 +756,22 @@ def reencode_image_worker(path_str: str, jpegtran: Optional[str], strip_chosen: 
     try:
         st, data = path.stat(), path.read_bytes()
         if ext in JPEG_EXTS:
-            if not jpegtran:
-                return path_str, "skipped", "jpegtran not installed (no lossy fallback is used)"
+            if mozjpeg_lossless is None and not jpegtran:
+                return path_str, "skipped", "no lossless JPEG optimiser available (no lossy fallback is used)"
             _, extra = strip_jpeg(data, 1)
             if not strip_chosen and any("after end-of-image" in r for r in extra):
-                return path_str, "skipped", "has embedded extra images/video (motion photo, depth or HDR gain map) that jpegtran would destroy"
-            with Image.open(io.BytesIO(data)) as im:
-                progressive = bool(im.info.get("progressive") or im.info.get("progression"))
-            # Flip baseline <-> progressive so the byte stream always changes; DCT coefficients stay identical.
-            cmd = [jpegtran, "-copy", "all", "-optimize"] + ([] if progressive else ["-progressive"]) + ["-outfile", str(tmp), str(path)]
-            r = run_cmd(cmd, timeout=600)
-            if r.returncode != 0 or not tmp.exists():
-                return path_str, "failed", f"jpegtran failed: {r.stderr.decode('utf-8', 'replace').strip()[-300:]}"
+                return path_str, "skipped", "has embedded extra images/video (motion photo, depth or HDR gain map) that re-encoding would destroy"
+            if mozjpeg_lossless is not None:
+                # Same transform as mozjpeg's `jpegtran -optimize -progressive`: DCT coefficients untouched.
+                tmp.write_bytes(mozjpeg_lossless.optimize(data, copy=mozjpeg_lossless.COPY_MARKERS.ALL))
+            else:
+                with Image.open(io.BytesIO(data)) as im:
+                    progressive = bool(im.info.get("progressive") or im.info.get("progression"))
+                # Flip baseline <-> progressive so the byte stream always changes; DCT coefficients stay identical.
+                cmd = [jpegtran, "-copy", "all", "-optimize"] + ([] if progressive else ["-progressive"]) + ["-outfile", str(tmp), str(path)]
+                r = run_cmd(cmd, timeout=600)
+                if r.returncode != 0 or not tmp.exists():
+                    return path_str, "failed", f"jpegtran failed: {r.stderr.decode('utf-8', 'replace').strip()[-300:]}"
             new = tmp.read_bytes()
         else:
             new = None
@@ -827,47 +860,116 @@ def reencode_audio(path: Path, ffmpeg: str, ffprobe: str) -> Tuple[str, str]:
     finally:
         discard(tmp)
 
-# ---------- Guaranteed hash change: random padding when no lossless re-encode is possible ----------
-# The padding is 16 random bytes in a block every decoder ignores (JPEG comment, private PNG chunk,
-# GIF comment, container tag). It carries no personal data; it only makes the bytes unique.
+# ---------- Unique padding: 16 random bytes per file, so no two people ever end up with the same hash ----------
+# Strip and lossless re-encode are deterministic: the same photo processed by two people gives byte-identical
+# output. Padding breaks that link. The 16 bytes come from os.urandom (the OS cryptographic RNG), freshly drawn
+# for every file on every run, so outputs differ from person to person and from run to run (2^128 possibilities).
+# They sit in a block every decoder ignores (JPEG comment, private PNG chunk, GIF comment, unknown WebP chunk,
+# unreferenced bytes after TIFF/BMP data, container tag) and carry no personal data. Processing a file again -
+# with this copy of the app or anyone else's - REPLACES the previous padding instead of adding more, so files
+# never grow from repeated runs.
+PAD_TAG = b"pad:"
+
 def _nonce() -> bytes: return os.urandom(16)
+
+def _drop_jpeg_padding(data: bytes) -> bytes:
+    """Remove earlier padding comments anywhere in the header (an optimiser may have moved them)."""
+    out, i = bytearray(data[:2]), 2
+    while i + 4 <= len(data) and data[i] == 0xFF and data[i + 1] not in (0xDA, 0xD9):
+        seg_len = struct.unpack(">H", data[i + 2:i + 4])[0]
+        seg = data[i:i + 2 + seg_len]
+        if not (data[i + 1] == 0xFE and seg[4:4 + len(PAD_TAG)] == PAD_TAG):
+            out += seg
+        i += 2 + seg_len
+    return bytes(out) + data[i:]
 
 def pad_jpeg(data: bytes) -> bytes:
     if data[:2] != b"\xff\xd8": raise ValueError("not a JPEG (missing SOI marker)")
+    data = _drop_jpeg_padding(data)                     # previous padding: replace it, never stack it
     # Insert after a leading JFIF APP0 if there is one (it should stay first), otherwise right after SOI.
     # Everything after the insertion point moves by the same amount, so MPF offsets (relative to the MPF
     # header) and offsets measured from the end of file (motion photos) stay valid.
     at = 2
     if data[2:4] == b"\xff\xe0" and data[6:11] == b"JFIF\x00":
         at = 4 + struct.unpack(">H", data[4:6])[0]
-    body = b"pad:" + _nonce().hex().encode()
+    body = PAD_TAG + _nonce().hex().encode()
     return data[:at] + b"\xff\xfe" + struct.pack(">H", len(body) + 2) + body + data[at:]
 
 def pad_png(data: bytes) -> bytes:
     if not data.startswith(PNG_SIG): raise ValueError("not a PNG")
-    at = 8
+    out, at = bytearray(PNG_SIG), 8
     while True:                                        # walk the chunks to the real IEND
         if at + 8 > len(data): raise ValueError("PNG has no IEND chunk (truncated)")
         length, ctype = struct.unpack(">I4s", data[at:at + 8])
         if ctype == b"IEND": break
+        if ctype != b"prVt":                           # previous padding: replace it
+            out += data[at:at + 12 + length]
         at += 12 + length
-    return data[:at] + _png_chunk(b"prVt", _nonce()) + data[at:]   # private, ancillary, safe-to-copy
+    return bytes(out) + _png_chunk(b"prVt", _nonce()) + data[at:]   # private, ancillary, safe-to-copy
+
+_GIF_PAD_LEN = 2 + 1 + len(PAD_TAG) + 32 + 1          # 21 FE, size byte, "pad:" + 32 hex chars, terminator
 
 def pad_gif(data: bytes) -> bytes:
     _, removed = strip_gif(data)                       # walks the block structure (raises if truncated)
     trailing = next((int(r.split()[0]) for r in removed if r.endswith("after GIF trailer")), 0)
     at = len(data) - trailing - 1
     if data[at] != 0x3B: raise ValueError("GIF trailer not found")
-    n = _nonce()
-    return data[:at] + b"\x21\xfe" + bytes((len(n),)) + n + b"\x00" + data[at:]
+    head = data[:at]
+    if len(head) >= _GIF_PAD_LEN and head[-_GIF_PAD_LEN:-_GIF_PAD_LEN + 7] == b"\x21\xfe\x24" + PAD_TAG:
+        head = head[:-_GIF_PAD_LEN]                    # previous padding: replace it
+    body = PAD_TAG + _nonce().hex().encode()
+    return head + b"\x21\xfe" + bytes((len(body),)) + body + b"\x00" + data[at:]
 
-IMAGE_PADDERS = {".jpg": pad_jpeg, ".jpeg": pad_jpeg, ".jfif": pad_jpeg, ".png": pad_png, ".gif": pad_gif}
+def pad_webp(data: bytes) -> bytes:
+    if data[:4] != b"RIFF" or data[8:12] != b"WEBP": raise ValueError("not a WebP")
+    riff_end = min(len(data), 8 + struct.unpack("<I", data[4:8])[0])
+    chunks, i = [], 12
+    while i + 8 <= riff_end:
+        fourcc, size = data[i:i + 4], struct.unpack("<I", data[i + 4:i + 8])[0]
+        if i + 8 + size > riff_end: raise ValueError("truncated WebP chunk")
+        end = min(i + 8 + size + (size & 1), riff_end)
+        if fourcc != b"PADD":                          # previous padding: replace it
+            chunks.append(data[i:end])
+        i = end
+    if not chunks: raise ValueError("WebP has no image data")
+    if chunks[0][:4] != b"VP8X":
+        # Simple-format WebP can't carry extra chunks; wrap it in the extended format (same image data).
+        with Image.open(io.BytesIO(data)) as im:
+            w, h = im.size
+            alpha = im.mode in ("RGBA", "LA", "PA") or "transparency" in im.info
+        chunks.insert(0, b"VP8X" + struct.pack("<I", 10) + bytes((0x10 if alpha else 0, 0, 0, 0))
+                      + (w - 1).to_bytes(3, "little") + (h - 1).to_bytes(3, "little"))
+    chunks.append(b"PADD" + struct.pack("<I", 16) + _nonce())    # unknown chunk: decoders must ignore it
+    payload = b"WEBP" + b"".join(chunks)
+    return b"RIFF" + struct.pack("<I", len(payload)) + payload + data[riff_end:]
+
+# TIFF and BMP have no comment block, so the padding goes after the image data (found via offsets, so readers
+# never look there), behind a fixed signature that lets the next run find and replace it instead of stacking.
+_TAIL_SIG = b"\x00SMP-pad\x00"
+
+def _append_tail_padding(data: bytes) -> bytes:
+    n = len(_TAIL_SIG) + 16
+    if len(data) > n and data[-n:-16] == _TAIL_SIG:
+        data = data[:-n]                               # previous padding: replace it
+    return data + _TAIL_SIG + _nonce()
+
+def pad_tiff(data: bytes) -> bytes:
+    if data[:4] not in (b"II*\x00", b"MM\x00*"): raise ValueError("not a TIFF")
+    return _append_tail_padding(data)
+
+def pad_bmp(data: bytes) -> bytes:
+    if data[:2] != b"BM": raise ValueError("not a BMP")
+    new = _append_tail_padding(data)
+    return new[:2] + struct.pack("<I", len(new)) + new[6:]     # keep the header's file size accurate
+
+IMAGE_PADDERS = {".jpg": pad_jpeg, ".jpeg": pad_jpeg, ".jfif": pad_jpeg, ".png": pad_png, ".gif": pad_gif,
+                 ".webp": pad_webp, ".tif": pad_tiff, ".tiff": pad_tiff, ".bmp": pad_bmp}
 
 def pad_image_worker(path_str: str) -> Tuple[str, str, str]:
     path = Path(path_str)
     padder = IMAGE_PADDERS.get(path.suffix.lower())
     if padder is None:
-        return path_str, "skipped", "no lossless way to change this format's bytes; hash NOT changed"
+        return path_str, "skipped", "padding not supported for this format; hash NOT made unique"
     tmp = tmp_path_for(path)
     try:
         st, data = path.stat(), path.read_bytes()
@@ -969,7 +1071,7 @@ class Options:
     strip: bool = False
     dedupe: bool = False
     reencode: bool = False
-    force_new_hash: bool = True        # re-encode fallback: random padding when bytes would not change
+    unique_hash: bool = True           # add 16 random bytes to every file: hashes never match anyone else's
     rename: bool = False
     hash_report: bool = True           # sha256 every file before and after, list the unchanged ones
     phash_threshold: int = DEFAULT_PHASH_THRESHOLD
@@ -982,13 +1084,18 @@ class Options:
     def planned_steps(self) -> List[str]:
         steps = []
         if self.merge_folders or self.folder_prefix: steps.append("Folder merge")
-        if self.hash_report and (self.strip or self.reencode): steps.append("Hashing (before)")
+        if self.hash_report and self.changes_hashes: steps.append("Hashing (before)")
         if self.strip: steps.append("Metadata strip")
         if self.dedupe: steps.append("Deduplication")
         if self.reencode: steps.append("Lossless re-encode")
+        if self.unique_hash: steps.append("Unique padding")
         if self.rename: steps.append("Renaming")
-        if self.hash_report and (self.strip or self.reencode): steps.append("Hashing (after)")
+        if self.hash_report and self.changes_hashes: steps.append("Hashing (after)")
         return steps
+
+    @property
+    def changes_hashes(self) -> bool:
+        return self.strip or self.reencode or self.unique_hash
 
 @dataclass
 class RunContext:
@@ -1022,9 +1129,10 @@ class Tools:
     jpegtran: Optional[str]
 
 def find_tools() -> Tools:
-    """PATH lookup, after putting a bundled 'tools' folder (next to the app or the exe) first on PATH.
-    Changing PATH (not just remembering paths) means worker processes and v7's hashing code find them too."""
-    for d in (Path(sys.executable).resolve().parent / "tools", Path(__file__).resolve().parent / "tools"):
+    """PATH lookup, after putting the tools folders first on PATH: a 'tools' folder next to the exe or the
+    script, and the per-user folder the app installs ffmpeg into. Changing PATH (not just remembering paths)
+    means worker processes and v7's hashing code find them too."""
+    for d in (Path(sys.executable).resolve().parent / "tools", Path(__file__).resolve().parent / "tools", TOOLS_DIR):
         if d.is_dir() and str(d) not in os.environ.get("PATH", "").split(os.pathsep):
             os.environ["PATH"] = str(d) + os.pathsep + os.environ.get("PATH", "")
     return Tools(which("ffmpeg"), which("ffprobe"), which("jpegtran"))
@@ -1049,10 +1157,37 @@ def scan(root: Path) -> ScanResult:
                       sum(is_audio(p) for p in files), len(media_folders(root)), pairs,
                       root.parent == root or root == Path.home().resolve())
 
-def default_log_path() -> Path:
-    """Outside the processed folder on purpose: the log lists original file names and hashes."""
-    base = Path(os.environ.get("LOCALAPPDATA") or Path.home() / ".local" / "share") / "SecureMediaProcessor" / "logs"
-    return ensure_dir(base) / f"run_{time.strftime('%Y%m%d_%H%M%S')}.txt"
+def load_settings() -> dict:
+    try:
+        return json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+
+def save_settings(settings: dict):
+    ensure_dir(SETTINGS_FILE.parent)
+    SETTINGS_FILE.write_text(json.dumps(settings, indent=2), encoding="utf-8")
+
+def log_dir() -> Path:
+    """The user's chosen log folder (settings.json "log_dir"), else the default under LOCALAPPDATA."""
+    chosen = load_settings().get("log_dir")
+    return Path(chosen) if chosen else DEFAULT_LOG_DIR
+
+def set_log_dir(folder: Optional[Path]):
+    """Remember the log folder for the app and the CLI; None resets to the default."""
+    settings = load_settings()
+    if folder is None: settings.pop("log_dir", None)
+    else: settings["log_dir"] = str(Path(folder).resolve())
+    save_settings(settings)
+
+def log_inside_root(folder: Path, root: Path) -> bool:
+    """True when logs would land inside the folder being processed (they list original names and hashes)."""
+    try:
+        return Path(folder).resolve().is_relative_to(Path(root).resolve())
+    except OSError:
+        return False
+
+def default_log_path(folder: Optional[Path] = None) -> Path:
+    return ensure_dir(Path(folder) if folder else log_dir()) / f"run_{time.strftime('%Y%m%d_%H%M%S')}.txt"
 
 # ---------- Steps ----------
 def _report(step: str, root: Path, path: Path, status: str, detail: str, stats: StepStats):
@@ -1130,42 +1265,42 @@ def step_reencode(root: Path, pool: Executor, opts: Options, tools: Tools, strip
     videos = [p for p in files if is_video(p)]
     audio = [p for p in files if is_audio(p)]
     log.info(f"=== STEP: {step} ({len(images)} images, {len(videos)} videos, {len(audio)} audio) ===")
-    to_pad_img: List[Path] = []
-    to_pad_av: List[Path] = []
     for fut in _drain([pool.submit(reencode_image_worker, str(p), tools.jpegtran, strip_chosen) for p in images], ctx, f"{step} (images)"):
         path, status, detail = fut.result()
-        if status != "changed" and opts.force_new_hash:
-            log.info(f"REENCODE | {Path(path).relative_to(root)} | {status}: {detail} -> adding random padding instead")
-            to_pad_img.append(Path(path))
-            continue
         _report("REENCODE", root, Path(path), status, detail, stats)
     if (videos or audio) and not (tools.ffmpeg and tools.ffprobe):
         log.warning(f"ffmpeg/ffprobe not found: {len(videos) + len(audio)} video/audio files were NOT re-encoded")
         stats.skipped += len(videos) + len(audio)
-    else:
-        av = videos + audio
-        ctx.tick(f"{step} (video/audio)", 0, len(av))
-        for k, p in enumerate(av, 1):     # one at a time: ffmpeg already uses every core
-            ctx.check()
-            if is_video(p):
-                log.info(f"Re-encoding video {k}/{len(av)}: {p.relative_to(root)} ({p.stat().st_size / 1e6:,.1f} MB)")
-                status, detail = reencode_video(p, tools.ffmpeg)
-            else:
-                status, detail = reencode_audio(p, tools.ffmpeg, tools.ffprobe)
-            if status != "changed" and opts.force_new_hash:
-                log.info(f"REENCODE | {p.relative_to(root)} | {status}: {detail} -> adding random padding instead")
-                to_pad_av.append(p)
-            else:
-                _report("REENCODE", root, p, status, detail, stats)
-            ctx.tick(f"{step} (video/audio)", k, len(av))
-    if to_pad_img:
-        for fut in _drain([pool.submit(pad_image_worker, str(p)) for p in to_pad_img], ctx, f"{step} (padding images)"):
-            path, status, detail = fut.result()
-            _report("PADDING", root, Path(path), status, detail, stats)
-    for k, p in enumerate(to_pad_av, 1):
+        return stats
+    av = videos + audio
+    ctx.tick(f"{step} (video/audio)", 0, len(av))
+    for k, p in enumerate(av, 1):     # one at a time: ffmpeg already uses every core
         ctx.check()
-        _report("PADDING", root, p, *pad_av(p, tools.ffmpeg), stats)
-        ctx.tick(f"{step} (padding video/audio)", k, len(to_pad_av))
+        if is_video(p):
+            log.info(f"Re-encoding video {k}/{len(av)}: {p.relative_to(root)} ({p.stat().st_size / 1e6:,.1f} MB)")
+            _report("REENCODE", root, p, *reencode_video(p, tools.ffmpeg), stats)
+        else:
+            _report("REENCODE", root, p, *reencode_audio(p, tools.ffmpeg, tools.ffprobe), stats)
+        ctx.tick(f"{step} (video/audio)", k, len(av))
+    return stats
+
+def step_pad(root: Path, pool: Executor, tools: Tools, ctx: RunContext) -> StepStats:
+    step = "Unique padding"
+    stats, files = StepStats(), media_files(root)
+    images = [p for p in files if is_image(p)]
+    av = [p for p in files if is_video(p) or is_audio(p)]
+    log.info(f"=== STEP: {step} ({len(images)} images, {len(av)} video/audio files) ===")
+    for fut in _drain([pool.submit(pad_image_worker, str(p)) for p in images], ctx, f"{step} (images)"):
+        path, status, detail = fut.result()
+        _report("PADDING", root, Path(path), status, detail, stats)
+    if av and not tools.ffmpeg:
+        log.warning(f"ffmpeg not found: {len(av)} video/audio files were NOT padded (their hashes are not unique)")
+        stats.skipped += len(av)
+    elif av:
+        with ThreadPoolExecutor(max_workers=min(4, CPU_COUNT)) as tpool:
+            futs = {tpool.submit(pad_av, p, tools.ffmpeg): p for p in av}
+            for fut in _drain(futs, ctx, f"{step} (video/audio)"):
+                _report("PADDING", root, futs[fut], *fut.result(), stats)
     return stats
 
 def step_rename(root: Path, ctx: RunContext) -> int:
@@ -1200,7 +1335,7 @@ def run_pipeline(root: Path, opts: Options, progress: Optional[ProgressFn] = Non
         sweep_tmp_files(root)
         if opts.merge_folders or opts.folder_prefix:
             results.append(f"Folder merge    : {step_merge(root, opts, ctx)}")
-        report = opts.hash_report and (opts.strip or opts.reencode)
+        report = opts.hash_report and opts.changes_hashes
         before = hash_all(root, ctx, "Hashing (before)") if report else {}
         executor = ProcessPoolExecutor if opts.use_processes else ThreadPoolExecutor
         with executor(max_workers=CPU_COUNT) as pool:
@@ -1212,6 +1347,8 @@ def run_pipeline(root: Path, opts: Options, progress: Optional[ProgressFn] = Non
                                f"{n_bad} unreadable -> {root / CORRUPT_DIRNAME}")
             if opts.reencode:
                 results.append(f"Lossless re-enc : {step_reencode(root, pool, opts, tools, opts.strip, ctx)}")
+            if opts.unique_hash:
+                results.append(f"Unique padding  : {step_pad(root, pool, tools, ctx)}")
         if opts.rename:
             results.append(f"Renaming        : {step_rename(root, ctx)} file(s) renamed")
         if report:

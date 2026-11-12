@@ -12,6 +12,7 @@ HOW TO RUN:
 
     --root-dir "D:\other\folder"   process another folder
     --update                       pull the latest version from GitHub
+    --log-dir "D:\logs"             save the run log there (default: the folder set in the app)
 """
 import argparse, logging, sys, time
 from pathlib import Path
@@ -54,6 +55,8 @@ def main():
     ap = argparse.ArgumentParser(description="Merge folders, strip metadata, deduplicate, losslessly re-encode and rename media.")
     ap.add_argument("--root-dir", type=str, default=None, help="Folder to process (default: the current folder)")
     ap.add_argument("--update", action="store_true", help="Check GitHub for a newer version and install it")
+    ap.add_argument("--log-dir", type=str, default=None,
+                    help="Folder for the run log (default: the folder chosen in the app, else %%LOCALAPPDATA%%)")
     ap.add_argument("--phash-threshold", type=int, default=core.DEFAULT_PHASH_THRESHOLD)
     ap.add_argument("--dhash-img-threshold", type=int, default=core.DEFAULT_DHASH_THRESHOLD_IMG)
     ap.add_argument("--dhash-vid-threshold", type=int, default=core.DEFAULT_DHASH_THRESHOLD_VID)
@@ -75,8 +78,11 @@ def main():
     print("=" * 72)
     print(f" Root folder : {root}")
     print(f" Found       : {sc.images} images, {sc.videos} videos, {sc.audio} audio files in {sc.folders} folder(s)")
+    jpeg = "built in" if core.mozjpeg_lossless is not None else ("jpegtran" if tools.jpegtran else "NO")
     print(f" Tools       : ffmpeg={'yes' if tools.ffmpeg else 'NO'}  ffprobe={'yes' if tools.ffprobe else 'NO'}  "
-          f"jpegtran={'yes' if tools.jpegtran else 'NO'}")
+          f"JPEG optimiser={jpeg}")
+    if not (tools.ffmpeg and tools.ffprobe):
+        print("               (install ffmpeg from the desktop app, or put ffmpeg.exe/ffprobe.exe in a tools folder)")
     if sc.risky_root:
         print("\n WARNING: this is a drive root or your home folder. Every media file below it will be processed.")
     if not sc.total and not sc.merge_pairs:
@@ -109,18 +115,22 @@ def main():
 
     print("\nd) LOSSLESS RE-ENCODING  ** CHANGES THE CONTENT HASH (SHA-256/MD5) **")
     print("   Rewrites each file; decoded pixels/frames/samples stay bit-identical (verified).")
-    print("   Where that can't change the bytes (e.g. no jpegtran, lossy audio), 16 random padding")
-    print("   bytes are added instead (no personal data), so the hash still changes.")
     print("   Size: JPEG a few % smaller; PNG/GIF/TIFF about the same; lossy WebP LARGER;")
     print("         VIDEO -> FFV1 .mkv MUCH LARGER (typically 5-20x+) and slow.")
     opts.reencode = ask_yes_no("   Lossless re-encoding needed?")
+
+    print("\nd2) UNIQUE HASHES  ** CHANGES THE CONTENT HASH (SHA-256/MD5) **")
+    print("   Adds 16 random bytes (OS cryptographic RNG, fresh per file per run) where viewers ignore them.")
+    print("   Strip and re-encode alone are deterministic: two people processing the same photo would get")
+    print("   the same hash. With this, no other person or run ever produces the same file.")
+    opts.unique_hash = ask_yes_no("   Make every file's hash unique?")
 
     print("\ne) DEDUPLICATION")
     print("   Perceptual hashing (p-hash + d-hash, Hamming distance) within each folder.")
     print(f"   The oldest copy is kept; duplicates go to '{core.DUP_DIRNAME}', unreadable files to '{core.CORRUPT_DIRNAME}'.")
     opts.dedupe = ask_yes_no("   Deduplication needed?")
 
-    if opts.strip or opts.reencode:
+    if opts.changes_hashes:
         print("\nf) HASH CHECK")
         print("   SHA-256 of every file before and after; lists any file whose hash did NOT change.")
         print("   Reads every file twice (slow on large video libraries).")
@@ -145,7 +155,10 @@ def main():
             print(f"  ... {step}: {done}/{total}")
             last.update(step=step, t=now)
 
-    log_path = core.default_log_path()
+    log_folder = Path(args.log_dir) if args.log_dir else core.log_dir()
+    if core.log_inside_root(log_folder, root):
+        print(f"\n NOTE: the log goes inside the processed folder ({log_folder}); it lists original file names.")
+    log_path = core.default_log_path(log_folder)
     try:
         results = core.run_pipeline(root, opts, progress=progress, log_path=log_path)
     except (KeyboardInterrupt, core.Cancelled):

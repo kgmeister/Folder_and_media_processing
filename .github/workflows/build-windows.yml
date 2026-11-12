@@ -1,0 +1,46 @@
+# Builds SecureMediaProcessor.exe on every push to main and publishes it as the latest GitHub release.
+# The app's "Check for updates" (packaged exe) downloads from that release.
+name: Build Windows app
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write          # needed to create the release
+
+concurrency:
+  group: build-windows
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt pyinstaller
+
+      - name: Run tests
+        run: python -m pytest -q tests
+
+      - name: Build exe
+        run: python build_exe.py
+
+      - name: Publish release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          short="${GITHUB_SHA::7}"
+          gh release create "build-${GITHUB_RUN_NUMBER}" dist/SecureMediaProcessor.exe \
+            --target "$GITHUB_SHA" \
+            --title "Build ${GITHUB_RUN_NUMBER} (${short})" \
+            --notes "commit: ${GITHUB_SHA}" \
+            --latest

@@ -15,3 +15,8 @@ tools/
 
 .pytest_cache/
 build/
+
+# build output (python build_exe.py)
+dist/
+_build_info.py
+*.spec

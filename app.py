@@ -7,7 +7,7 @@ Secure Media Processor - desktop app (Flet). Same engine as the command line
     python app.py
 
 Layout: 1. Folder  ->  2. Options  ->  3. Run (progress, log, cancel).
-The only network access is the manual "Check for updates" button.
+The only network access is what you click: "Check for updates" and "Install ffmpeg".
 """
 import asyncio, collections, logging, os, sys, threading
 from pathlib import Path
@@ -16,6 +16,7 @@ from typing import Optional
 import flet as ft
 
 import media_core as core
+import tools_installer
 import updater
 
 APP_TITLE = "Secure Media Processor"
@@ -60,10 +61,12 @@ def main(page: ft.Page):
     page.window.width, page.window.height = 1000, 900
     page.window.min_width, page.window.min_height = 720, 640
 
+    updater.cleanup_old_exe()
     log_handler = UiLogHandler()
     core.log.addHandler(log_handler)
     picker = ft.FilePicker()
-    state = {"root": None, "scan": None, "running": False, "progress": None, "cancel": None}
+    state = {"root": None, "scan": None, "running": False, "progress": None, "cancel": None,
+             "log_dir": core.log_dir(), "tools": None}
 
     # ---------------- 1. Folder ----------------
     folder_field = ft.TextField(label="Root folder", read_only=True, expand=True,
@@ -73,12 +76,62 @@ def main(page: ft.Page):
     warn_text = ft.Text("", size=13, color=ft.Colors.ERROR, weight=ft.FontWeight.W_600, visible=False)
 
     def describe_tools(t: core.Tools) -> str:
-        mark = lambda x: "found" if x else "MISSING"
-        notes = []
-        if not (t.ffmpeg and t.ffprobe): notes.append("video/audio steps and video dedupe are skipped")
-        if not t.jpegtran: notes.append("JPEGs get random padding instead of a jpegtran re-encode")
-        return (f"ffmpeg {mark(t.ffmpeg)} · ffprobe {mark(t.ffprobe)} · jpegtran {mark(t.jpegtran)}"
-                + (f"  ->  {'; '.join(notes)}" if notes else ""))
+        jpeg = ("built in" if core.mozjpeg_lossless is not None else
+                "jpegtran" if t.jpegtran else "MISSING (JPEGs are not re-encoded)")
+        av = "found" if (t.ffmpeg and t.ffprobe) else "MISSING (video/audio steps and video dedupe are skipped)"
+        return f"ffmpeg: {av} · JPEG optimiser: {jpeg}"
+
+    async def refresh_tools():
+        t = await asyncio.to_thread(core.find_tools)
+        state["tools"] = t
+        tools_text.value, tools_text.visible = describe_tools(t), True
+        install_btn.visible = tools_installer.supported() and not (t.ffmpeg and t.ffprobe)
+        page.update()
+        return t
+
+    async def install_ffmpeg(e=None):
+        bar = ft.ProgressBar(value=0, bar_height=6, border_radius=3)
+        msg = ft.Text(f"Downloading ffmpeg (about {tools_installer.APPROX_DOWNLOAD_MB} MB) from the BtbN builds on GitHub...")
+        close = ft.TextButton("Close", on_click=lambda ev: page.pop_dialog(), disabled=True)
+        page.show_dialog(ft.AlertDialog(modal=True, title=ft.Text("Installing ffmpeg"),
+                                        content=ft.Column([msg, bar], tight=True, width=480), actions=[close]))
+        progress = {"done": 0, "total": 0}
+        job = asyncio.create_task(asyncio.to_thread(
+            tools_installer.install_ffmpeg, lambda d, t: progress.update(done=d, total=t)))
+        while not job.done():
+            if progress["total"]:
+                bar.value = progress["done"] / progress["total"]
+                msg.value = f"Downloading ffmpeg: {progress['done'] / 1e6:,.0f} / {progress['total'] / 1e6:,.0f} MB"
+            page.update()
+            await asyncio.sleep(0.3)
+        try:
+            msg.value = job.result() + "\nThe checksum matched BtbN's published sha256."
+            bar.value = 1
+        except tools_installer.InstallError as ex:
+            msg.value = f"ffmpeg was not installed: {ex}"
+        close.disabled = False
+        page.update()
+        await refresh_tools()
+        refresh()
+
+    async def offer_ffmpeg():
+        """Ask once at startup when ffmpeg is missing (downloading is never automatic: it is network access)."""
+        t = await refresh_tools()
+        if t.ffmpeg and t.ffprobe or not tools_installer.supported():
+            return
+
+        async def yes(ev):
+            page.pop_dialog()
+            await install_ffmpeg()
+
+        page.show_dialog(ft.AlertDialog(
+            modal=True, title=ft.Text("ffmpeg is not installed"),
+            content=ft.Text("Video and audio processing, and video duplicate detection, need ffmpeg.\n\n"
+                            f"Download it now? About {tools_installer.APPROX_DOWNLOAD_MB} MB from the BtbN FFmpeg "
+                            "builds on GitHub, checked against their published checksum, installed only for this "
+                            "app (no admin rights, nothing added to the system).", width=480),
+            actions=[ft.TextButton("Not now", on_click=lambda ev: page.pop_dialog()),
+                     ft.FilledButton("Download and install", icon=ft.Icons.DOWNLOAD, on_click=yes)]))
 
     async def choose_folder(e):
         path = await picker.get_directory_path(dialog_title="Choose the folder to process")
@@ -91,16 +144,15 @@ def main(page: ft.Page):
         scan_text.value = "Scanning..."
         page.update()
         sc = await asyncio.to_thread(core.scan, root)
-        tools = await asyncio.to_thread(core.find_tools)
         state["root"], state["scan"] = root, sc
         scan_text.value = (f"{sc.images:,} images · {sc.videos:,} videos · {sc.audio:,} audio files "
                            f"in {sc.folders:,} folder(s) · {sc.merge_pairs} '@' folder pair(s) to merge")
-        tools_text.value, tools_text.visible = describe_tools(tools), True
         warn_text.value = "This is a drive root or your home folder - every media file below it will be processed."
         warn_text.visible = sc.risky_root
         refresh()
 
     choose_btn = ft.FilledButton("Choose folder...", icon=ft.Icons.FOLDER_OPEN, on_click=choose_folder)
+    install_btn = ft.TextButton("Install ffmpeg", icon=ft.Icons.DOWNLOAD, on_click=install_ffmpeg, visible=False)
 
     # ---------------- 2. Options ----------------
     cb_merge = ft.Checkbox(label="Folder merge", value=False)
@@ -108,9 +160,8 @@ def main(page: ft.Page):
                                 disabled=True)
     cb_strip = ft.Checkbox(label="Strip metadata", value=False)
     cb_dedupe = ft.Checkbox(label="Remove duplicates", value=False)
-    cb_reencode = ft.Checkbox(label="Lossless re-encode (guaranteed new file hash)", value=False)
-    sw_pad = ft.Switch(label="If a file can't be re-encoded, add 16 random padding bytes so its hash still changes",
-                       value=True, disabled=True)
+    cb_reencode = ft.Checkbox(label="Lossless re-encode", value=False)
+    cb_unique = ft.Checkbox(label="Make every file's hash unique", value=True)
     cb_rename = ft.Checkbox(label="Rename files after their folder", value=False)
     cb_hash = ft.Checkbox(label="Hash check: list any file whose content hash did NOT change", value=True,
                           disabled=True)
@@ -139,9 +190,12 @@ def main(page: ft.Page):
                           f"is kept; duplicates move to '{core.DUP_DIRNAME}', unreadable files to "
                           f"'{core.CORRUPT_DIRNAME}'."),
         option(cb_reencode, "Rewrites every file; decoded pixels/frames/samples stay bit-identical (verified). "
-                            "JPEG via jpegtran is a few % smaller, PNG/GIF/TIFF about the same, lossy WebP larger. "
+                            "JPEG a few % smaller (built-in mozjpeg), PNG/GIF/TIFF about the same, lossy WebP larger. "
                             "VIDEO becomes FFV1 .mkv: typically 5-20x LARGER and slow.", badge("changes file hash")),
-        ft.Container(sw_pad, padding=ft.Padding.only(left=40)),
+        option(cb_unique, "Adds 16 random bytes (OS cryptographic random generator, fresh for every file on every "
+                          "run) where viewers ignore them. Strip and re-encode alone are deterministic: two people "
+                          "processing the same photo would get the same hash. With this, nobody else - and no other "
+                          "run - ever produces the same file. No personal data is added.", badge("changes file hash")),
         option(cb_rename, "'<folder name> (N).<ext>', numbered 1..N oldest first per extension, no gaps. Removes "
                           "identifying original names such as IMG_20250101_123456.jpg."),
         option(cb_hash, "SHA-256 of every file before and after the run. Reads every file twice."),
@@ -157,12 +211,41 @@ def main(page: ft.Page):
     log_box = ft.Container(log_view, border=ft.Border.all(1, ft.Colors.OUTLINE_VARIANT), border_radius=8, padding=8)
     summary_col = ft.Column(spacing=2)
 
+    # Log folder: chosen by the user, remembered for the app and the command line.
+    log_dir_text = ft.Text("", size=12, selectable=True, expand=True)
+    log_warn_text = ft.Text("", size=12, color=ft.Colors.ORANGE_800, visible=False)
+
+    def show_log_dir():
+        d = state["log_dir"]
+        default = d == core.DEFAULT_LOG_DIR
+        log_dir_text.value = f"Log folder: {d}" + ("  (default)" if default else "")
+        inside = state["root"] is not None and core.log_inside_root(d, state["root"])
+        log_warn_text.value = ("The log folder is inside the folder being processed. Logs list original file names "
+                               "and hashes, so they would travel with your files.")
+        log_warn_text.visible = inside
+
+    async def change_log_dir(e):
+        path = await picker.get_directory_path(dialog_title="Choose where run logs are saved",
+                                               initial_directory=str(state["log_dir"]))
+        if path:
+            core.set_log_dir(Path(path))
+            state["log_dir"] = core.log_dir()
+            refresh()
+
+    def reset_log_dir(e):
+        core.set_log_dir(None)
+        state["log_dir"] = core.log_dir()
+        refresh()
+
+    log_change_btn = ft.TextButton("Change...", icon=ft.Icons.EDIT_NOTE, on_click=change_log_dir)
+    log_reset_btn = ft.TextButton("Use default", on_click=reset_log_dir)
+
     def build_options() -> core.Options:
         to_int = lambda f, d: int(f.value) if (f.value or "").isdigit() else d
         return core.Options(
             merge_folders=bool(cb_merge.value), folder_prefix=(prefix_field.value or "").strip() if cb_merge.value else "",
             strip=bool(cb_strip.value), dedupe=bool(cb_dedupe.value), reencode=bool(cb_reencode.value),
-            force_new_hash=bool(sw_pad.value), rename=bool(cb_rename.value), hash_report=bool(cb_hash.value),
+            unique_hash=bool(cb_unique.value), rename=bool(cb_rename.value), hash_report=bool(cb_hash.value),
             phash_threshold=to_int(f_phash, core.DEFAULT_PHASH_THRESHOLD),
             dhash_img_threshold=to_int(f_dimg, core.DEFAULT_DHASH_THRESHOLD_IMG),
             dhash_vid_threshold=to_int(f_dvid, core.DEFAULT_DHASH_THRESHOLD_VID),
@@ -171,13 +254,14 @@ def main(page: ft.Page):
 
     def refresh(e=None):
         running = state["running"]
+        opts = build_options()
         prefix_field.disabled = running or not cb_merge.value
-        sw_pad.disabled = running or not cb_reencode.value
-        cb_hash.disabled = running or not (cb_strip.value or cb_reencode.value)
-        for c in (cb_merge, cb_strip, cb_dedupe, cb_reencode, cb_rename, choose_btn, f_phash, f_dimg, f_dvid,
-                  f_hsize, f_frames):
+        cb_hash.disabled = running or not opts.changes_hashes
+        for c in (cb_merge, cb_strip, cb_dedupe, cb_reencode, cb_unique, cb_rename, choose_btn, f_phash, f_dimg,
+                  f_dvid, f_hsize, f_frames, log_change_btn, log_reset_btn, install_btn):
             c.disabled = running
-        steps = build_options().planned_steps()
+        steps = opts.planned_steps()
+        show_log_dir()
         start_btn.disabled = running or state["root"] is None or not steps
         cancel_btn.disabled = not running
         update_btn.disabled = running
@@ -187,7 +271,7 @@ def main(page: ft.Page):
                                "Ready: " + " -> ".join(steps))
         page.update()
 
-    for c in (cb_merge, cb_strip, cb_dedupe, cb_reencode, cb_rename, cb_hash, sw_pad):
+    for c in (cb_merge, cb_strip, cb_dedupe, cb_reencode, cb_unique, cb_rename, cb_hash):
         c.on_change = refresh
 
     def flush_ui():
@@ -216,7 +300,7 @@ def main(page: ft.Page):
         progress_bar.value = None
         step_text.value = "Starting..."
         refresh()
-        log_path = core.default_log_path()
+        log_path = core.default_log_path(state["log_dir"])
 
         def on_progress(step, done, total):
             state["progress"] = (step, done, total)
@@ -279,6 +363,9 @@ def main(page: ft.Page):
                 ft.Text("Files are changed IN PLACE.", color=ft.Colors.ERROR, weight=ft.FontWeight.W_600)]
         if sc and sc.risky_root:
             body.append(ft.Text("This is a drive root or your home folder.", color=ft.Colors.ERROR))
+        if core.log_inside_root(state["log_dir"], state["root"]):
+            body.append(ft.Text("The log will be saved inside this folder (it lists original file names).",
+                                color=ft.Colors.ORANGE_800))
         if opts.reencode and sc and sc.videos:
             body.append(ft.Text(f"{sc.videos:,} video(s) will be re-encoded to FFV1: expect 5-20x the disk space.",
                                 color=ft.Colors.ORANGE_800))
@@ -325,7 +412,9 @@ def main(page: ft.Page):
             page.update()
             try:
                 result = await asyncio.to_thread(updater.apply, info)
-                msg.value = f"{result}\n\nClose and reopen the app to use the new version."
+                msg.value = f"{result}\n\nRestart the app to use the new version."
+                dlg.actions = [ft.FilledButton("Restart now", icon=ft.Icons.RESTART_ALT,
+                                               on_click=lambda ev: updater.restart()), *actions]
             except updater.UpdateError as ex:
                 msg.value = f"Update failed, nothing was changed: {ex}"
             page.update()
@@ -337,20 +426,25 @@ def main(page: ft.Page):
     update_btn = ft.TextButton("Check for updates", icon=ft.Icons.SYSTEM_UPDATE, on_click=check_updates)
 
     # ---------------- Layout ----------------
+    version = updater.local_version()
     header = ft.Row([ft.Icon(ft.Icons.SHIELD, color=ft.Colors.TEAL_700, size=30),
                      ft.Column([ft.Text(APP_TITLE, size=22, weight=ft.FontWeight.BOLD),
-                                ft.Text("Offline. Nothing leaves this computer.", size=12,
-                                        color=ft.Colors.ON_SURFACE_VARIANT)], spacing=0, expand=True),
+                                ft.Text("Offline. Nothing leaves this computer unless you press Install or Update.",
+                                        size=12, color=ft.Colors.ON_SURFACE_VARIANT)], spacing=0, expand=True),
+                     ft.Text(f"version {version[:7]}" if version else "", size=12,
+                             color=ft.Colors.ON_SURFACE_VARIANT),
                      update_btn])
     page.add(ft.Column([
         header,
-        section(1, "Folder", ft.Column([ft.Row([folder_field, choose_btn]), scan_text, tools_text, warn_text],
-                                       spacing=6)),
+        section(1, "Folder", ft.Column([ft.Row([folder_field, choose_btn]), scan_text,
+                                        ft.Row([tools_text, install_btn], wrap=True), warn_text], spacing=6)),
         section(2, "Options", options_col),
-        section(3, "Run", ft.Column([ft.Row([start_btn, cancel_btn]), step_text, progress_bar, log_box, summary_col],
+        section(3, "Run", ft.Column([ft.Row([log_dir_text, log_change_btn, log_reset_btn]), log_warn_text,
+                                     ft.Row([start_btn, cancel_btn]), step_text, progress_bar, log_box, summary_col],
                                     spacing=8)),
     ], spacing=12, scroll=ft.ScrollMode.AUTO, expand=True))
     refresh()
+    page.run_task(offer_ffmpeg)
     # Optional: `python app.py "D:\folder"` opens with that folder already selected.
     if len(sys.argv) > 1 and Path(sys.argv[1]).is_dir():
         page.run_task(load_folder, Path(sys.argv[1]))

@@ -101,20 +101,64 @@ def test_strip_png_drops_text_chunks(tmp_path):
     new, removed = core.strip_png(data, 1)
     assert "tEXt" in removed and b"Kenneth" not in new and core.same_pixels(data, new)
 
-@pytest.mark.parametrize("fmt", ["jpg", "png", "gif"])
-def test_padding_changes_bytes_not_pixels(fmt):
+def sample(fmt: str) -> bytes:
     buf = io.BytesIO()
     if fmt == "jpg": buf.write(jpeg_with_metadata(3, trailing=b"EXTRA"))
     elif fmt == "png": picture(4).save(buf, "PNG")
-    else:
+    elif fmt == "gif":
         frames = [picture(10 + k, 120, 90).convert("P") for k in range(3)]
         frames[0].save(buf, "GIF", save_all=True, append_images=frames[1:], duration=[100, 200, 300], loop=0)
-    data = buf.getvalue()
-    new = core.IMAGE_PADDERS["." + fmt](data)
+    elif fmt == "webp-lossy": picture(5).save(buf, "WEBP", quality=80)
+    elif fmt == "webp-lossless-alpha": picture(5).convert("RGBA").save(buf, "WEBP", lossless=True, exact=True)
+    elif fmt == "webp-extended":
+        ex = Image.Exif(); ex[0x010F] = "cam"; picture(5).save(buf, "WEBP", quality=80, exif=ex.tobytes())
+    elif fmt == "tif": picture(6).save(buf, "TIFF", compression="tiff_lzw")
+    elif fmt == "bmp": picture(7).save(buf, "BMP")
+    return buf.getvalue()
+
+PAD_FORMATS = ["jpg", "png", "gif", "webp-lossy", "webp-lossless-alpha", "webp-extended", "tif", "bmp"]
+
+@pytest.mark.parametrize("fmt", PAD_FORMATS)
+def test_padding_changes_bytes_not_pixels(fmt):
+    data = sample(fmt)
+    ext = "." + fmt.split("-")[0]
+    new = core.IMAGE_PADDERS[ext](data)
     assert new != data and core.same_pixels(data, new)
     assert core.exif_orientation(new) == core.exif_orientation(data)
     if fmt == "jpg":
         assert new.endswith(b"EXTRA")                 # embedded extra data after the image survives
+    for _ in range(3):                                # padding again replaces the old padding: no growth
+        again = core.IMAGE_PADDERS[ext](new)
+        assert again != new and len(again) == len(new) and core.same_pixels(data, again)
+        new = again
+
+def test_reprocessing_does_not_inflate_files(tmp_path):
+    """Someone feeds an app-processed folder into their own copy of the app: sizes must not keep growing."""
+    build_tree(tmp_path)
+    for name, fmt in (("t.tif", "tif"), ("b.bmp", "bmp"), ("w.webp", "webp-lossy"), ("g.gif", "gif")):
+        (tmp_path / "Album" / name).write_bytes(sample(fmt))
+    opts = core.Options(strip=True, reencode=True, unique_hash=True, hash_report=False, use_processes=False)
+    core.run_pipeline(tmp_path, opts)
+    first = {f.name: (f.stat().st_size, core.sha256_file(f)) for f in core.media_files(tmp_path)}
+    for _ in range(2):
+        core.run_pipeline(tmp_path, opts)
+    again = {f.name: (f.stat().st_size, core.sha256_file(f)) for f in core.media_files(tmp_path)}
+    assert {n: s for n, (s, _) in again.items()} == {n: s for n, (s, _) in first.items()}
+    assert all(again[n][1] != first[n][1] for n in first)      # new random hash every time
+
+def test_unique_padding_makes_hashes_differ_between_people(tmp_path):
+    """Two people process the same photos: with padding no output hash is shared; without it, all are."""
+    def outputs(where: Path, unique: bool) -> set:
+        build_tree(where)
+        core.run_pipeline(where, core.Options(strip=True, reencode=True, unique_hash=unique, hash_report=False,
+                                              use_processes=False))
+        return {core.sha256_file(f) for f in core.media_files(where)}
+    plain_a, plain_b = outputs(tmp_path / "a", False), outputs(tmp_path / "b", False)
+    assert plain_a == plain_b                         # deterministic: this is the problem padding solves
+    uniq_a, uniq_b = outputs(tmp_path / "c", True), outputs(tmp_path / "d", True)
+    assert not uniq_a & uniq_b and not uniq_a & plain_a
+    # the tree holds an identical pair (x.png, x_copy.png): without padding they share a hash, with it they don't
+    assert len(plain_a) == 3 and len(uniq_a) == 4
 
 # ---------------------------------------------------------------- folder merge
 def test_folder_merge_and_prefix(tmp_path):
@@ -173,6 +217,9 @@ def test_video_strip_and_padding(tmp_path):
     before = clip.read_bytes()
     status, _ = core.pad_av(clip, ff)
     assert status == "changed" and clip.read_bytes() != before
+    once = clip.read_bytes()
+    status, _ = core.pad_av(clip, ff)                 # the padding tag is replaced, not added again
+    assert status == "changed" and clip.read_bytes() != once and len(clip.read_bytes()) == len(once)
 
 # ---------------------------------------------------------------- updater
 def test_updater_snapshot_install(tmp_path, monkeypatch):
@@ -209,3 +256,65 @@ def test_updater_refuses_broken_snapshot(tmp_path, monkeypatch):
     with pytest.raises(updater.UpdateError):
         updater.apply(updater.UpdateInfo(None, "f" * 40, "", ""))
     assert (app / "media_core.py").read_text() == "OLD = 1\n"
+
+def test_updater_exe_swap(tmp_path, monkeypatch):
+    exe = tmp_path / "SecureMediaProcessor.exe"; exe.write_bytes(b"MZ old build")
+    new_bytes = b"MZ new build"
+    monkeypatch.setattr(updater, "_download", lambda url, dest: dest.write_bytes(new_bytes))
+    good = updater.UpdateInfo("a" * 40, "b" * 40, "", "Build 7", download_url="x",
+                              digest="sha256:" + __import__("hashlib").sha256(new_bytes).hexdigest())
+    assert "Installed" in updater._apply_exe(good, exe)
+    assert exe.read_bytes() == new_bytes and (tmp_path / "SecureMediaProcessor.exe.old").read_bytes() == b"MZ old build"
+    bad = updater.UpdateInfo("a" * 40, "c" * 40, "", "Build 8", download_url="x", digest="sha256:" + "0" * 64)
+    with pytest.raises(updater.UpdateError):
+        updater._apply_exe(bad, exe)
+    assert exe.read_bytes() == new_bytes and not (tmp_path / "SecureMediaProcessor.exe.download").exists()
+
+# ---------------------------------------------------------------- settings / tools installer
+def test_log_dir_setting(tmp_path, monkeypatch):
+    monkeypatch.setattr(core, "SETTINGS_FILE", tmp_path / "settings.json")
+    assert core.log_dir() == core.DEFAULT_LOG_DIR
+    core.set_log_dir(tmp_path / "mylogs")
+    assert core.log_dir() == (tmp_path / "mylogs").resolve()
+    assert core.default_log_path().parent == (tmp_path / "mylogs").resolve()
+    assert core.log_inside_root(tmp_path / "media" / "logs", tmp_path / "media")
+    assert not core.log_inside_root(tmp_path / "mylogs", tmp_path / "media")
+    core.set_log_dir(None)
+    assert core.log_dir() == core.DEFAULT_LOG_DIR
+
+def _fake_ffmpeg_zip() -> bytes:
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        for name in ("ffmpeg.exe", "ffprobe.exe", "ffplay.exe", "avcodec-61.dll"):
+            zf.writestr(f"ffmpeg-n8.1-win64-lgpl-shared-8.1/bin/{name}", b"MZ fake " + name.encode())
+        zf.writestr("ffmpeg-n8.1-win64-lgpl-shared-8.1/doc/readme.txt", "docs")
+    return buf.getvalue()
+
+@pytest.mark.skipif(sys.platform != "win32", reason="ffmpeg install is Windows-only")
+def test_tools_installer_verifies_and_unpacks(tmp_path, monkeypatch):
+    import hashlib, tools_installer as ti
+    blob = _fake_ffmpeg_zip()
+    def fake_get(url, dest=None, progress=None):
+        if url.endswith("checksums.sha256"):
+            return f"{hashlib.sha256(blob).hexdigest()}  {ti.ZIP_NAME}\n".encode()
+        dest.write_bytes(blob)
+        return b""
+    monkeypatch.setattr(ti, "_get", fake_get)
+    monkeypatch.setattr(ti.subprocess, "run", lambda *a, **k: subprocess.CompletedProcess(a, 0, "ffmpeg version n8.1 Copyright", ""))
+    msg = ti.install_ffmpeg(target=tmp_path / "tools")
+    assert sorted(p.name for p in (tmp_path / "tools").iterdir()) == ["avcodec-61.dll", "ffmpeg.exe", "ffprobe.exe"]
+    assert "ffmpeg version n8.1" in msg
+
+@pytest.mark.skipif(sys.platform != "win32", reason="ffmpeg install is Windows-only")
+def test_tools_installer_rejects_bad_checksum(tmp_path, monkeypatch):
+    import tools_installer as ti
+    blob = _fake_ffmpeg_zip()
+    def fake_get(url, dest=None, progress=None):
+        if url.endswith("checksums.sha256"):
+            return f"{'0' * 64}  {ti.ZIP_NAME}\n".encode()
+        dest.write_bytes(blob)
+        return b""
+    monkeypatch.setattr(ti, "_get", fake_get)
+    with pytest.raises(ti.InstallError):
+        ti.install_ffmpeg(target=tmp_path / "tools")
+    assert not (tmp_path / "tools").exists()
