@@ -12,6 +12,8 @@ uploaded. One engine (`src/media_core.py`) runs behind three front ends: the Win
 Pipeline steps (fixed order, each optional), all in `run_pipeline()`:
 
 1. Folder merge: `@name` folders merged into `name`; optional prefix for top-level folders
+   (then Extension fix / check, with any file step: wrong extensions are renamed, or with the option off kept,
+   and every later step processes the file as its real format either way)
 2. Hashing (before): sha256 of every file, for the hash check at the end
 3. Metadata strip: lossless; images by container surgery, video/audio by ffmpeg stream copy
 4. Deduplication: p-hash/d-hash per folder (logic copied verbatim from `legacy/..._v7.py`, BK-tree speed-up);
@@ -52,6 +54,38 @@ original's modification time is kept. A failed verification always keeps the ori
 
 ## Change log
 
+### 2026-11-15 (later): wrong extensions renamed or kept; invalid packet durations repaired
+
+A second phone run on `Signal_fails` (the open item below) showed the real reason the MP4 still failed:
+`Application provided duration: 3878973300 in stream 0 is invalid`. That is a broken sample duration (a negative
+32-bit value, -415993996, read as unsigned) on the last packet. ffmpeg's muxer only accepts 0..2^31-1, and
+`+genpts` does not touch durations, so the earlier retry failed the same way.
+
+- **Packet durations.** The `remux()` retry now also adds `-bsf FIX_DURATIONS_BSF` (`setts`), which replaces a
+  duration outside 0..2^31-1 with the previous packet's (or 0). Packet data is untouched; streamhash verification
+  still passes. With 0 instead of the previous duration, the output reported ~6000 s, hence the previous one.
+  `explain_ffmpeg_error()` recognises "provided duration". Reproduced with ffmpeg 8.0.1 (the Android version) by
+  patching the last `stts` entry of a generated MP4 (`mp4_with_broken_last_duration()` in the tests) and fixed.
+  The Android build does not disable bitstream filters, so `setts` is there.
+- **Extension fix step** (`Options.fix_extensions`, default on; GUI checkbox, CLI prompt "e2"). Runs after Folder
+  merge and before everything else, whenever a step that works on files is selected (`Options.processes_files`).
+  `true_extension()`: images by signature (`image_format()`), anything else by `probe_container()` (ffprobe:
+  container + whether there is a real video stream). An MP4/MOV without video becomes `.m4a`; MPEG-TS becomes
+  `.mts`. Same container family (e.g. `.mov`/`.mp4`, `.webm`/`.mkv`) is not renamed; unknown formats are left alone.
+  Renames use `free_name()`, so they never overwrite. Each rename is a summary note; a failed rename is a problem.
+  `container_override()` stays for runs with the option off. `.mts`/`.m2ts` added to `VIDEO_EXTS`.
+- **Keeping wrong extensions** (option off = "Extension check"). Before this, with names kept, only video/audio
+  within their own category worked: a PNG named `.jpg` failed strip and padding, and an MP4 named `.gif` was moved to
+  `Corrupted/` by dedupe. Now the check step records each file's real extension in `_REAL_EXT` (main process; cleared
+  at the start and end of every run), and `is_image/is_video/is_audio` go through `kind_ext()`, so every step sorts
+  the file by its real format. Image workers (strip, pad, re-encode) choose their parser with `image_ext()` from the
+  file's signature, which also works in worker processes. `reencode_audio()` uses `kind_ext()`. The remux "file is
+  really X" note is not repeated for files the check step already noted. Re-encoded videos/audio still get
+  `.mkv`/`.flac`, since their content changes format. "Files at start" is counted after the check, by real format.
+- Tests added: broken-duration MP4 (strip and pad), image signatures, step planning, full pipeline with four
+  wrong-extension files plus a name clash, kept wrong image extensions, kept `.gif` video. `dist/` copies of `media_core.py`, `app.py`, `secure_media_processor.py`
+  synced. README steps table and "Logs" section updated.
+
 ### 2026-11-15: run summary at the end of every log; ffmpeg failures fixed and explained
 
 Reported from a phone run on `Signal_content/Duplicates`: both video files failed Metadata strip and Unique padding,
@@ -87,8 +121,10 @@ version display, CI releases.
 
 ## Open items
 
-- **Confirm the MP4 fix** on `signal-2026-01-16-21-41-10-528-4.mp4` (phone, `Signal_content/Duplicates`). If it
-  still fails, the run summary now shows the full ffmpeg reason. Use that, or reproduce with the file on a PC.
-- Rebuild the portable app on Windows (`scripts/make_portable.py`) if more than `media_core.py` changes.
+- **Confirm the duration fix on the phone** with `signal-2026-01-16-21-41-10-528-4.mp4` (`Signal_fails`). It was
+  reproduced and fixed on a PC with a patched file, not with the original.
+- Rebuild the portable app on Windows (`scripts/make_portable.py`) if more than the `src/*.py` copies change.
 - `test_android_ffmpeg_wheel_is_added_to_pyproject` needs Python 3.11+ (`tomllib`). CI uses 3.12.
-- Files with a wrong extension are kept under their name. Renaming them to the real extension could be an option.
+- `test_android_ffmpeg_wheel_installs_as_flet_would` needs a full pip; the portable runtime's pip is trimmed, so
+  it fails when the suite runs on that runtime (environment only).
+- Extension fix only looks at files that already have a media extension; a video named `.bin` is not found.

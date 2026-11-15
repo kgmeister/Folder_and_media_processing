@@ -265,6 +265,113 @@ def test_remux_retries_with_regenerated_timestamps(tmp_path, monkeypatch):
     src.write_bytes(b"x")
     r, notes, _ = core.remux(src, tmp, "ffmpeg", None, ["-c", "copy"])
     assert r.returncode == 0 and len(calls) == 2 and any("timestamps regenerated" in n for n in notes)
+    assert core.FIX_DURATIONS_BSF in calls[1] and core.FIX_DURATIONS_BSF not in calls[0]
+
+def mp4_with_broken_last_duration(path: Path):
+    """An MP4 like signal-2026-01-16-21-41-10-528-4.mp4: the last sample of each track has duration 3878973300
+    (a negative 32-bit value read as unsigned), which ffmpeg's muxer refuses: 'Application provided duration ...
+    is invalid'. Made by patching the last entry of every stts table."""
+    ff = shutil.which("ffmpeg")
+    subprocess.run([ff, "-v", "error", "-f", "lavfi", "-i", "testsrc=size=160x120:rate=25:duration=2", "-f", "lavfi",
+                    "-i", "sine=duration=2.01", "-vf", "setpts='if(eq(N,49),PTS+3,PTS)'", "-c:v", "mpeg4",
+                    "-c:a", "aac", "-metadata", "title=secret", str(path)], check=True)
+    data, i, patched = bytearray(path.read_bytes()), 0, 0
+    while (i := data.find(b"stts", i + 1)) != -1:
+        n = int.from_bytes(data[i + 8:i + 12], "big")
+        if n > 1:
+            data[i + 12 + 8 * (n - 1) + 4:i + 12 + 8 * n] = (3878973300).to_bytes(4, "big"); patched += 1
+    assert patched == 2
+    path.write_bytes(bytes(data))
+
+@needs_ffmpeg
+def test_invalid_packet_durations_are_repaired(tmp_path):
+    ff, fp = shutil.which("ffmpeg"), shutil.which("ffprobe")
+    clip = tmp_path / "signal.mp4"
+    mp4_with_broken_last_duration(clip)
+    plain = subprocess.run([ff, "-v", "error", "-y", "-i", str(clip), "-map", "0", "-c", "copy",
+                            str(tmp_path / "plain.mp4")], capture_output=True)
+    assert plain.returncode != 0 and b"Application provided duration: 3878973300" in plain.stderr
+    copy = tmp_path / "copy.mp4"
+    shutil.copy2(clip, copy)
+    status, detail = core.strip_av(clip, ff, fp)
+    assert status == "changed" and "packet durations repaired" in detail and b"secret" not in clip.read_bytes()
+    assert core._probe_duration(fp, clip) < 5          # the bad duration does not turn into hours of length
+    status, detail = core.pad_av(copy, ff, fp)          # padding alone, on the original file
+    assert status == "changed" and "packet durations repaired" in detail
+
+def test_true_extension_from_image_signatures(tmp_path):
+    picture(1).save(tmp_path / "a.jpg", format="PNG")
+    picture(1).save(tmp_path / "b.jpeg", format="JPEG")
+    picture(1).save(tmp_path / "c.png", format="WEBP")
+    picture(1).save(tmp_path / "d.webp", format="BMP")
+    (tmp_path / "e.gif").write_bytes(b"not an image at all")
+    assert core.true_extension(tmp_path / "a.jpg", None) == (".png", "PNG")
+    assert core.true_extension(tmp_path / "b.jpeg", None) is None
+    assert core.true_extension(tmp_path / "c.png", None) == (".webp", "WebP")
+    assert core.true_extension(tmp_path / "d.webp", None) == (".bmp", "BMP")
+    assert core.true_extension(tmp_path / "e.gif", None) is None       # unknown: left alone
+
+def test_extension_fix_is_planned_only_with_file_steps():
+    assert "Extension fix" not in core.Options(unique_hash=False, merge_folders=True).planned_steps()
+    steps = core.Options(merge_folders=True, rename=True, unique_hash=False).planned_steps()
+    assert steps == ["Folder merge", "Extension fix", "Renaming"]
+    assert core.Options(fix_extensions=False).planned_steps()[0] == "Extension check"
+
+def test_kept_wrong_image_extensions_are_processed_as_their_real_format(tmp_path):
+    """No ffmpeg needed: image workers read the signature, so a PNG named .jpg is stripped and padded as a PNG."""
+    alb = tmp_path / "Album"; alb.mkdir()
+    info = PngImagePlugin.PngInfo(); info.add_text("Author", "secret")
+    picture(1).save(alb / "photo.jpg", format="PNG", pnginfo=info)
+    (alb / "pic.png").write_bytes(jpeg_with_metadata())
+    results = core.run_pipeline(tmp_path, core.Options(strip=True, unique_hash=True, fix_extensions=False,
+                                                       use_processes=False))
+    assert sorted(p.name for p in alb.iterdir()) == ["photo.jpg", "pic.png"]
+    assert core.image_format((alb / "photo.jpg").read_bytes()) == "png"
+    assert b"secret" not in (alb / "photo.jpg").read_bytes() and b"SecretCam" not in (alb / "pic.png").read_bytes()
+    assert any(r.startswith("Extension check : 2 file(s)") for r in results)
+    assert any("2 of 2 files have a new content hash" in r for r in results) and not core._REAL_EXT
+
+@needs_ffmpeg
+def test_kept_wrong_video_extensions_are_processed_as_video(tmp_path):
+    """A messaging-app '.gif' that is an MP4 must be treated as a video, not moved to Corrupted as a broken image."""
+    ff = shutil.which("ffmpeg")
+    alb = tmp_path / "Album"; alb.mkdir()
+    subprocess.run([ff, "-v", "error", "-f", "lavfi", "-i", "testsrc=size=160x120:rate=10:duration=1",
+                    "-c:v", "mpeg4", "-metadata", "title=secret", "-f", "mp4", str(alb / "anim.gif")], check=True)
+    log_path = tmp_path.parent / f"{tmp_path.name}_log.txt"
+    core.run_pipeline(tmp_path, core.Options(strip=True, dedupe=True, unique_hash=True, fix_extensions=False,
+                                             use_processes=False), log_path=log_path)
+    assert [p.name for p in alb.iterdir()] == ["anim.gif"] and not (tmp_path / core.CORRUPT_DIRNAME).exists()
+    assert b"secret" not in (alb / "anim.gif").read_bytes()
+    summary = log_path.read_text(encoding="utf-8").split("RUN SUMMARY")[1]
+    assert "Files at start  : 1 (0 images, 1 videos" in summary and "Every file was processed as specified." in summary
+    assert "is really MP4 although named '.gif'; name kept as asked" in summary
+
+@needs_ffmpeg
+def test_pipeline_renames_wrong_extensions_then_processes_them(tmp_path):
+    ff = shutil.which("ffmpeg")
+    alb = tmp_path / "Album"; alb.mkdir()
+    mk = lambda name, *extra: subprocess.run(
+        [ff, "-v", "error", "-f", "lavfi", "-i", "testsrc=size=160x120:rate=10:duration=1", "-f", "lavfi",
+         "-i", "sine=duration=1", "-c:v", "mpeg4", "-c:a", "aac", "-metadata", "title=secret", *extra,
+         "-f", "mp4", str(alb / name)], check=True)
+    mk("signal.mpeg")                                     # MP4 named .mpeg
+    mk("animation.gif", "-an")                            # messaging-app "GIF" that is an MP4 video
+    mk("voice.mp3", "-vn")                                # MP4 audio named .mp3 -> .m4a
+    mk("signal.mp4")                                      # right name: the renamed .mpeg must not overwrite it
+    picture(3).save(alb / "photo.jpg", format="PNG")      # PNG named .jpg
+    log_path = tmp_path.parent / f"{tmp_path.name}_log.txt"
+    results = core.run_pipeline(tmp_path, core.Options(strip=True, unique_hash=True, use_processes=False),
+                                log_path=log_path)
+    names = sorted(p.name for p in alb.iterdir())
+    assert names == ["animation.mp4", "photo.png", "signal.mp4", "signal_1.mp4", "voice.m4a"]
+    assert all(b"secret" not in (alb / n).read_bytes() for n in names)
+    assert "Extension fix   : 4 file(s) renamed to their real extension" in results
+    text = log_path.read_text(encoding="utf-8")
+    summary = text[text.index("RUN SUMMARY"):]
+    assert "Every file was processed as specified." in summary and "5 of 5 file(s) processed as specified" in summary
+    assert "was named 'signal.mpeg' but is really MP4; renamed to 'signal_1.mp4'" in summary
+    assert "was named 'photo.jpg' but is really PNG; renamed to 'photo.png'" in summary
 
 def test_log_ends_with_summary_of_files_not_processed(tmp_path):
     build_tree(tmp_path)

@@ -53,6 +53,7 @@ progress, live log, cancel. Files are changed **in place**, so keep a backup.
 | Step (in run order) | What it does | Changes content hash |
 |---|---|---|
 | Folder merge | Media from each top-level `@name` folder moves into `name`; optional prefix for top-level folder names | no |
+| Fix wrong extensions (on by default) | Runs before the other file steps: a file whose extension is not what it really is (by its content) gets the right one, e.g. an MP4 named `.mpeg` becomes `.mp4`, a `.gif` that is really a video becomes `.mp4`, a PNG named `.jpg` becomes `.png`. Clashing names get `_1`, `_2`... **Unticked, the names are kept** and each file is still processed as what it really is (a PNG named `.jpg` is stripped and padded as a PNG, a `.gif` that is a video is handled as a video). Re-encoding a video still makes it `.mkv`, because its content then is Matroska | no |
 | Strip metadata | Removes EXIF/GPS/XMP/IPTC/comments, container tags, chapters, cover art, telemetry. Lossless; keeps orientation and colour profile | yes, for files that had metadata |
 | Remove duplicates | pHash + dHash within each folder; the oldest copy is kept, the rest move to `Duplicates/` | no |
 | Lossless re-encode | Pixel/sample-exact re-encode, verified. JPEG via the built-in mozjpeg optimiser; video to FFV1 `.mkv` (**5-20x larger**) | yes |
@@ -90,9 +91,11 @@ files at the start, each step's counts, how many files were processed as specifi
 message (for example: *its audio/video formats cannot be stored in the MPEG program stream container that the
 '.mpeg' extension stands for*). Files moved to `Corrupted` and files whose hash did not change are listed there too.
 
-Video/audio named with the wrong extension (e.g. an MP4 saved as `.mpeg`, common with messaging apps) are rewritten
-in the container they really are, and keep their name. If the container writer refuses a file's timestamps, the copy
-is tried once more with regenerated timestamps; the audio/video packets are still verified identical either way.
+Files with the wrong extension are renamed to the right one first (the log notes the old and new name). With that
+option turned off, they keep their name and the log notes what each one really is; every step still processes them
+as their real format (video/audio are rewritten in the container they really are). If the container writer refuses a file's timestamps or packet durations (some Signal videos
+carry a broken last-packet duration), the copy is tried once more with regenerated timestamps and the invalid
+durations replaced; the audio/video packets are still verified identical either way.
 
 ## Updates (PC)
 
