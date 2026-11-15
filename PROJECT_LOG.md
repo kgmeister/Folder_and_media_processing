@@ -54,6 +54,14 @@ original's modification time is kept. A failed verification always keeps the ori
 
 ## Change log
 
+### 2026-11-15: phone layout, "changes file hash" badge no longer clipped
+
+On a portrait phone (larger Android font size) the badge beside "Make every file's hash unique" ran off the screen.
+`option(..., narrow=mobile)` in `app.py` now puts the badge on its own line under the checkbox, lined up with the
+description; the PC keeps it beside the checkbox. (A wrapping Row does not work: Flet's labelled Checkbox takes the
+full row width, so the badge always wrapped, on the PC too.) The phone header's version/update row wraps. Checked
+with `SMP_MOBILE_PREVIEW=1` at 412 and 360 px wide.
+
 ### 2026-11-15 (later): wrong extensions renamed or kept; invalid packet durations repaired
 
 A second phone run on `Signal_fails` (the open item below) showed the real reason the MP4 still failed:

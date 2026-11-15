@@ -48,11 +48,16 @@ def section(number: int, title: str, body: ft.Control) -> ft.Card:
     return ft.Card(ft.Container(ft.Column([head, body], spacing=12), padding=16))
 
 def option(checkbox: ft.Checkbox, description: str, tag: Optional[ft.Control] = None,
-           below: Optional[ft.Control] = None) -> ft.Column:
+           below: Optional[ft.Control] = None, narrow: bool = False) -> ft.Column:
+    """narrow (phone): the tag goes on its own line under the checkbox, lined up with the description. Side by side
+    it runs off a portrait phone screen, more so with Android's larger font sizes."""
     indent = lambda c: ft.Container(c, padding=ft.Padding.only(left=40))
-    rows = [ft.Row([checkbox, tag] if tag else [checkbox], spacing=8,
-                   vertical_alignment=ft.CrossAxisAlignment.CENTER),
-            indent(ft.Text(description, size=12, color=ft.Colors.ON_SURFACE_VARIANT))]
+    if tag and narrow:
+        rows = [checkbox, indent(ft.Row([tag]))]
+    else:
+        rows = [ft.Row([checkbox, tag] if tag else [checkbox], spacing=8,
+                       vertical_alignment=ft.CrossAxisAlignment.CENTER)]
+    rows.append(indent(ft.Text(description, size=12, color=ft.Colors.ON_SURFACE_VARIANT)))
     if below:
         rows.append(indent(below))
     return ft.Column(rows, spacing=2)
@@ -276,7 +281,7 @@ def main(page: ft.Page):
         option(cb_strip, "Removes EXIF (GPS, camera serial, dates), XMP, IPTC, comments, embedded thumbnails, "
                          "video/audio tags, chapters, cover art and GPS telemetry. Lossless: pixels, frames and "
                          "samples are untouched; orientation and colour profile are kept. Files that had no "
-                         "metadata stay byte-identical.", badge("changes file hash")),
+                         "metadata stay byte-identical.", badge("changes file hash"), narrow=mobile),
         option(cb_dedupe, "Perceptual hashing (pHash + dHash, Hamming distance) within each folder. The oldest copy "
                           f"is kept; duplicates move to '{core.DUP_DIRNAME}', unreadable files to "
                           f"'{core.CORRUPT_DIRNAME}'."),
@@ -285,11 +290,13 @@ def main(page: ft.Page):
                             "becomes FFV1 .mkv: typically 5-20x LARGER, and slow on a phone." if mobile else
                             "Rewrites every file; decoded pixels/frames/samples stay bit-identical (verified). "
                             "JPEG a few % smaller (built-in mozjpeg), PNG/GIF/TIFF about the same, lossy WebP larger. "
-                            "VIDEO becomes FFV1 .mkv: typically 5-20x LARGER and slow.", badge("changes file hash")),
+                            "VIDEO becomes FFV1 .mkv: typically 5-20x LARGER and slow.",
+               badge("changes file hash"), narrow=mobile),
         option(cb_unique, "Adds 16 random bytes (OS cryptographic random generator, fresh for every file on every "
                           "run) where viewers ignore them. Strip and re-encode alone are deterministic: two people "
                           "processing the same photo would get the same hash. With this, nobody else - and no other "
-                          "run - ever produces the same file. No personal data is added.", badge("changes file hash")),
+                          "run - ever produces the same file. No personal data is added.",
+               badge("changes file hash"), narrow=mobile),
         option(cb_rename, "'<folder name> (N).<ext>', numbered 1..N oldest first per extension, no gaps. Removes "
                           "identifying original names such as IMG_20250101_123456.jpg."),
         option(cb_hash, ("Lists any file whose content hash did NOT change. " if mobile else "")
@@ -554,7 +561,7 @@ def main(page: ft.Page):
     version_text = ft.Text(f"Version {updater.describe_local()}", size=12, color=ft.Colors.ON_SURFACE_VARIANT)
     icon = ft.Image(src="icon.png", width=40 if mobile else 44, height=40 if mobile else 44)
     if mobile:      # narrow screen: stack what sits side by side on the PC
-        header = ft.Column([ft.Row([icon, title_col]), ft.Row([version_text, update_btn],
+        header = ft.Column([ft.Row([icon, title_col]), ft.Row([version_text, update_btn], wrap=True,
                                                               alignment=ft.MainAxisAlignment.SPACE_BETWEEN)], spacing=2)
         folder_row = ft.Column([folder_field, choose_btn], spacing=8)
         log_row = ft.Column([log_dir_text, ft.Row([log_change_btn, log_reset_btn])], spacing=0)
