@@ -54,6 +54,27 @@ original's modification time is kept. A failed verification always keeps the ori
 
 ## Change log
 
+### 2026-11-16: options: one-line summaries, plain-language details behind a chevron
+
+Replaces the 2026-11-15 badge fix below: `option()`'s `narrow=` parameter is gone.
+
+- **Layout.** `option(checkbox, summary, details, tag, below)` in `app.py`. The checkbox has no label of its own
+  (`visual_density=COMPACT`, 40 px on phone and PC). Title, badge and one-line summary sit in a column to its
+  right, and a chevron `IconButton` on the far right shows or hides the details. A labelled Checkbox sits in a
+  48 px tap-target row, which left an awkward gap above the description and made the old badge line necessary. The
+  badge now sits in a wrapping Row beside the title and wraps only when the line is too narrow; this works because
+  the title is a plain Text, not the Checkbox's full-width label. Tapping the title or summary toggles the box.
+  The title Text is stored in `checkbox.data`, and `sync_option_titles()` (called from `refresh()`) greys it out when
+  the box is disabled.
+- **Text.** Summaries stay within about 40 characters, so they fit on one line on a portrait phone. The details are
+  written for beginners: no EXIF/pHash/FFV1 jargon, and a hash is called a fingerprint. If you add an option, follow
+  the same pattern.
+- **Advanced thresholds.** The "pHash threshold" floating label was clipped against the tile header; there is now
+  12 px of top padding. On phones the five fields form a two-column `ResponsiveRow` (`col=6`) instead of a centred
+  single column; the PC keeps the wrapping row of 140 px fields.
+- `dist/` copy of `app.py` synced (LF). Checked against the bundled Flet 1.1.2 (option builds, toggles, chevron
+  opens and closes); not yet looked at on a phone.
+
 ### 2026-11-15: phone layout, "changes file hash" badge no longer clipped
 
 On a portrait phone (larger Android font size) the badge beside "Make every file's hash unique" ran off the screen.
@@ -94,6 +115,20 @@ A second phone run on `Signal_fails` (the open item below) showed the real reaso
   wrong-extension files plus a name clash, kept wrong image extensions, kept `.gif` video. `dist/` copies of `media_core.py`, `app.py`, `secure_media_processor.py`
   synced. README steps table and "Logs" section updated.
 
+### 2026-11-15: Windows fixes (CI test failure; ffmpeg error parsing)
+
+- **CI failure on Windows** in `test_log_ends_with_summary_of_files_not_processed`. The run summary writes
+  OS-native paths (`Album\broken.jpg` on Windows), like every other log line, but the test searched for
+  `Album/broken.jpg`. Fixed in the test (`os.path.join`), not the engine.
+- **ffmpeg errors misread on Windows.** Windows ffmpeg builds print context addresses without `0x`
+  (`[mpeg @ 00000248b41fa080]`), and `_FF_LINE` only recognised `@ 0x...`. As a result the address leaked into
+  the message, and `[warning]` lines were counted as the specific error. On Windows a `.mpeg` file that is really
+  MP4/AAC (stripped without ffprobe) therefore got the generic "could not copy its streams" text, citing a VBV
+  warning, instead of the wrong-extension explanation. The address prefix is now `@ (?:0x)?[0-9a-fA-F]+`.
+  This was caught locally by `test_video_with_wrong_extension_keeps_its_real_container`. CI skips that test
+  because the runner has no ffmpeg.
+- `dist/` copy of `media_core.py` synced (LF). All 42 tests pass on Windows with ffmpeg on PATH.
+
 ### 2026-11-15: run summary at the end of every log; ffmpeg failures fixed and explained
 
 Reported from a phone run on `Signal_content/Duplicates`: both video files failed Metadata strip and Unique padding,
@@ -132,6 +167,9 @@ version display, CI releases.
 - **Confirm the duration fix on the phone** with `signal-2026-01-16-21-41-10-528-4.mp4` (`Signal_fails`). It was
   reproduced and fixed on a PC with a patched file, not with the original.
 - Rebuild the portable app on Windows (`scripts/make_portable.py`) if more than the `src/*.py` copies change.
+- CI has no ffmpeg, so the video/audio tests are skipped there. The 2026-11-15 Windows parsing bug got through
+  because of this. Installing ffmpeg in `.github/workflows/build.yml` (at least on the Windows job) would close
+  the gap. Until then, run the suite locally with ffmpeg on PATH before pushing ffmpeg changes.
 - `test_android_ffmpeg_wheel_is_added_to_pyproject` needs Python 3.11+ (`tomllib`). CI uses 3.12.
 - `test_android_ffmpeg_wheel_installs_as_flet_would` needs a full pip; the portable runtime's pip is trimmed, so
   it fails when the suite runs on that runtime (environment only).
