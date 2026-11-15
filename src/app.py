@@ -242,6 +242,7 @@ def main(page: ft.Page):
 
     # ---------------- 2. Options ----------------
     cb_merge = ft.Checkbox(label="Folder merge", value=False)
+    cb_fixext = ft.Checkbox(label="Fix wrong file extensions", value=True)
     prefix_field = ft.TextField(label="Folder name prefix (optional)", dense=True, width=None if mobile else 420,
                                 disabled=True, tooltip="Added to the start of each top-level folder name")
     cb_strip = ft.Checkbox(label="Strip metadata", value=False)
@@ -268,6 +269,10 @@ def main(page: ft.Page):
     options_col = ft.Column([
         option(cb_merge, "Moves the media in each top-level '@name' folder into 'name'. Never overwrites: "
                          "clashing names get _1, _2... Non-media and subfolders stay in '@name'.", below=prefix_field),
+        option(cb_fixext, "Before the other steps, renames any file whose extension is not what it really is (for "
+                          "example a .mpeg that is really an MP4, or a .gif that is really a video) to the right "
+                          "extension. The content is not changed. Unticked: names are kept as they are, and each "
+                          "file is still processed as what it really is."),
         option(cb_strip, "Removes EXIF (GPS, camera serial, dates), XMP, IPTC, comments, embedded thumbnails, "
                          "video/audio tags, chapters, cover art and GPS telemetry. Lossless: pixels, frames and "
                          "samples are untouched; orientation and colour profile are kept. Files that had no "
@@ -335,6 +340,7 @@ def main(page: ft.Page):
             merge_folders=bool(cb_merge.value), folder_prefix=(prefix_field.value or "").strip() if cb_merge.value else "",
             strip=bool(cb_strip.value), dedupe=bool(cb_dedupe.value), reencode=bool(cb_reencode.value),
             unique_hash=bool(cb_unique.value), rename=bool(cb_rename.value), hash_report=bool(cb_hash.value),
+            fix_extensions=bool(cb_fixext.value),
             phash_threshold=to_int(f_phash, core.DEFAULT_PHASH_THRESHOLD),
             dhash_img_threshold=to_int(f_dimg, core.DEFAULT_DHASH_THRESHOLD_IMG),
             dhash_vid_threshold=to_int(f_dvid, core.DEFAULT_DHASH_THRESHOLD_VID),
@@ -346,6 +352,7 @@ def main(page: ft.Page):
         opts = build_options()
         prefix_field.disabled = running or not cb_merge.value
         cb_hash.disabled = running or not opts.changes_hashes
+        cb_fixext.disabled = running or not opts.processes_files
         for c in (cb_merge, cb_strip, cb_dedupe, cb_reencode, cb_unique, cb_rename, choose_btn, f_phash, f_dimg,
                   f_dvid, f_hsize, f_frames, log_change_btn, log_reset_btn, install_btn):
             c.disabled = running
@@ -360,7 +367,7 @@ def main(page: ft.Page):
                                "Ready: " + " -> ".join(steps))
         page.update()
 
-    for c in (cb_merge, cb_strip, cb_dedupe, cb_reencode, cb_unique, cb_rename, cb_hash):
+    for c in (cb_merge, cb_fixext, cb_strip, cb_dedupe, cb_reencode, cb_unique, cb_rename, cb_hash):
         c.on_change = refresh
 
     def flush_ui():

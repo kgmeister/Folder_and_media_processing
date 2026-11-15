@@ -91,7 +91,8 @@ Image.MAX_IMAGE_PIXELS = None
 
 # Config
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", ".jfif", ".tif", ".tiff"}
-VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".m4v", ".flv", ".3gp", ".wmv", ".mpg", ".mpeg", ".webm"}
+VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".m4v", ".flv", ".3gp", ".wmv", ".mpg", ".mpeg", ".webm",
+              ".mts", ".m2ts"}
 AUDIO_EXTS = {".mp3", ".flac", ".wav", ".aiff", ".aif", ".m4a", ".ogg", ".opus"}
 MEDIA_EXTS = IMAGE_EXTS | VIDEO_EXTS | AUDIO_EXTS
 
@@ -157,10 +158,19 @@ def setup_file_logger(log_path: Path):
     log.addHandler(fh)
     return fh
 
+# Files whose wrong extension the user chose to keep (Extension check with names kept): path -> the extension of what
+# the file really is. Filled in the main process at the start of a run and cleared at its end, so a '.gif' that is
+# really a video is handled as a video by every step. Image workers do not need it: they read the file's signature.
+_REAL_EXT: Dict[str, str] = {}
+
+def kind_ext(p: Path) -> str:
+    """The extension that decides how a file is handled: its own, or that of its real format when the name was kept."""
+    return _REAL_EXT.get(str(p), p.suffix.lower())
+
 def is_media(p: Path) -> bool: return p.is_file() and p.suffix.lower() in MEDIA_EXTS
-def is_image(p: Path) -> bool: return p.suffix.lower() in IMAGE_EXTS
-def is_video(p: Path) -> bool: return p.suffix.lower() in VIDEO_EXTS
-def is_audio(p: Path) -> bool: return p.suffix.lower() in AUDIO_EXTS
+def is_image(p: Path) -> bool: return kind_ext(p) in IMAGE_EXTS
+def is_video(p: Path) -> bool: return kind_ext(p) in VIDEO_EXTS
+def is_audio(p: Path) -> bool: return kind_ext(p) in AUDIO_EXTS
 
 def safe_move(src: Path, dst_dir: Path, new_name: Optional[str] = None) -> Optional[Path]:
     ensure_dir(dst_dir)
@@ -701,13 +711,14 @@ IMAGE_STRIPPERS = {".jpg": strip_jpeg, ".jpeg": strip_jpeg, ".jfif": strip_jpeg,
 
 def strip_image_worker(path_str: str) -> Tuple[str, str, str]:
     path = Path(path_str)
-    stripper = IMAGE_STRIPPERS.get(path.suffix.lower())
-    if stripper is None:
-        if path.suffix.lower() == ".bmp": return path_str, "unchanged", "BMP has no metadata container"
-        return path_str, "skipped", "metadata strip not supported for this format (use exiftool)"
     tmp = None
     try:
         st, data = path.stat(), path.read_bytes()
+        ext = image_ext(path, data)
+        stripper = IMAGE_STRIPPERS.get(ext)
+        if stripper is None:
+            if ext == ".bmp": return path_str, "unchanged", "BMP has no metadata container"
+            return path_str, "skipped", "metadata strip not supported for this format (use exiftool)"
         orientation = exif_orientation(data)
         new, removed = stripper(data, orientation)
         if new == data:
@@ -733,6 +744,7 @@ AV_STRIP_MAPS = ["0:V?", "0:a?", "0:s?"]
 # Container family ffmpeg picks from the file name, and the muxer to use for each container ffprobe can detect.
 EXT_CONTAINER = {".mp4": "mp4", ".m4v": "mp4", ".m4a": "mp4", ".mov": "mp4", ".3gp": "mp4",
                  ".mkv": "matroska", ".webm": "matroska", ".mpg": "mpeg", ".mpeg": "mpeg", ".avi": "avi",
+                 ".mts": "mpegts", ".m2ts": "mpegts",
                  ".flv": "flv", ".wmv": "asf", ".mp3": "mp3", ".flac": "flac", ".wav": "wav",
                  ".aiff": "aiff", ".aif": "aiff", ".ogg": "ogg", ".opus": "ogg"}
 DEMUXER_CONTAINER = {"mov,mp4,m4a,3gp,3g2,mj2": "mp4", "matroska,webm": "matroska", "mpeg": "mpeg",
@@ -748,6 +760,13 @@ _FF_GENERIC = ("Last message repeated", "Task finished with error code", "Termin
                "Error while filtering", "Error closing", "Nothing was written into output file",
                "Error initializing output stream", "Could not write header")
 _TIMESTAMP_HINTS = ("dts", "pts", "timestamp", "out of range", "duration", "Error submitting a packet to the muxer")
+# Packet durations the container writer accepts are 0..2^31-1. Files re-saved by some messaging apps (Signal) carry
+# a broken sample duration, e.g. 3878973300 (= -415993996 read as unsigned), which ffmpeg refuses with "Application
+# provided duration: N in stream K is invalid". The retry replaces such a duration with the previous packet's (or 0);
+# packet data is untouched, and still verified identical afterwards. Commas are escaped for ffmpeg's bsf parser.
+_VALID_DUR = "between({0}\\,0\\,2147483647)"
+FIX_DURATIONS_BSF = (f"setts=duration='if({_VALID_DUR.format('DURATION')}\\,DURATION\\,"
+                     f"if({_VALID_DUR.format('PREV_INDURATION')}\\,PREV_INDURATION\\,0))'")
 
 def ffmpeg_error_summary(stderr: bytes, limit: int = 400) -> str:
     """The lines of ffmpeg's output that say WHY it failed: errors before warnings, specific before generic,
@@ -780,9 +799,9 @@ def explain_ffmpeg_error(msg: str, real: Optional[str] = None, ext: str = "") ->
         named = CONTAINER_NAMES.get(EXT_CONTAINER.get(ext, ""), ext)
         return (f"its audio/video formats cannot be stored in the {named} container that the '{ext}' extension "
                 f"stands for" + (f" (the file itself is {CONTAINER_NAMES.get(real, real)})" if real else ""))
-    if any(k in low for k in ("dts", "pts", "timestamp", "out of range", "packet duration")):
+    if any(k in low for k in ("dts", "pts", "timestamp", "out of range", "packet duration", "provided duration")):
         return ("its timestamps are irregular (common in files re-saved by messaging apps) and the container "
-                "writer refuses them, even after the timestamps were regenerated")
+                "writer refuses them, even after the timestamps and packet durations were repaired")
     if "error submitting a packet to the muxer" in low or "error muxing a packet" in low:
         return ("the container writer rejected some of its audio/video packets (usually irregular timestamps "
                 "from the app that saved it), even after the timestamps were regenerated")
@@ -794,26 +813,86 @@ def ffmpeg_failure(r, real: Optional[str], ext: str) -> str:
     msg = ffmpeg_error_summary(r.stderr)
     return f"{explain_ffmpeg_error(msg, real, ext)} [ffmpeg: {msg}]; original kept"
 
-def real_container(path: Path, ffprobe: Optional[str]) -> Optional[str]:
-    """The container the file really is (from its content, not its name), as a muxer name; None if unknown."""
-    if not ffprobe: return None
-    r = run_cmd([ffprobe, "-v", "error", "-show_entries", "format=format_name:format_tags=major_brand",
+def probe_container(path: Path, ffprobe: Optional[str]) -> Tuple[Optional[str], bool]:
+    """(container the file really is, from its content, as a muxer name or None if unknown; whether it has a real
+    video stream, i.e. not just audio and cover art)."""
+    if not ffprobe: return None, False
+    r = run_cmd([ffprobe, "-v", "error", "-show_entries",
+                 "format=format_name:format_tags=major_brand:stream=codec_type:stream_disposition=attached_pic",
                  "-of", "json", str(path)], timeout=120)
-    if r.returncode != 0: return None
-    try: fmt = json.loads(r.stdout.decode("utf-8", "replace")).get("format", {})
-    except ValueError: return None
+    if r.returncode != 0: return None, False
+    try: info = json.loads(r.stdout.decode("utf-8", "replace"))
+    except ValueError: return None, False
+    fmt = info.get("format", {})
     family = DEMUXER_CONTAINER.get(fmt.get("format_name", ""))
     if family == "mp4" and str(fmt.get("tags", {}).get("major_brand", "")).strip() == "qt":
-        return "mov"
-    return family
+        family = "mov"
+    has_video = any(s.get("codec_type") == "video" and not s.get("disposition", {}).get("attached_pic")
+                    for s in info.get("streams", []))
+    return family, has_video
+
+def real_container(path: Path, ffprobe: Optional[str]) -> Optional[str]:
+    """The container the file really is (from its content, not its name), as a muxer name; None if unknown."""
+    return probe_container(path, ffprobe)[0]
+
+def same_container(real: Optional[str], ext: str) -> bool:
+    """True when the extension stands for the container the file really is (or the real one is unknown)."""
+    named = EXT_CONTAINER.get(ext.lower())
+    return real is None or real == named or (real == "mov" and named == "mp4")
 
 def container_override(path: Path, ffprobe: Optional[str]) -> Tuple[Optional[str], Optional[str]]:
     """(muxer to force, real container): a muxer only when the name's extension stands for another container,
-    e.g. an MP4 with AAC audio named .mpeg, which ffmpeg would otherwise write as MPEG-PS (which cannot hold AAC)."""
+    e.g. an MP4 with AAC audio named .mpeg, which ffmpeg would otherwise write as MPEG-PS (which cannot hold AAC).
+    Runs without the Extension fix still reach here: the file is written in its real container, name kept."""
     real = real_container(path, ffprobe)
-    named = EXT_CONTAINER.get(path.suffix.lower())
-    same = real is None or real == named or (real == "mov" and named == "mp4")
-    return (None if same else real), real
+    return (None if same_container(real, path.suffix) else real), real
+
+# ---------- Wrong extensions: what a file really is, from its content ----------
+# The extension each real format gets when a file is renamed (first entry) and every extension that already fits.
+IMAGE_FORMAT_EXTS = {"jpeg": (".jpg", ".jpeg", ".jfif"), "png": (".png",), "gif": (".gif",), "webp": (".webp",),
+                     "bmp": (".bmp",), "tiff": (".tif", ".tiff")}
+IMAGE_FORMAT_NAMES = {"jpeg": "JPEG", "png": "PNG", "gif": "GIF", "webp": "WebP", "bmp": "BMP", "tiff": "TIFF"}
+CONTAINER_EXT = {"mp4": ".mp4", "mov": ".mov", "matroska": ".mkv", "mpeg": ".mpg", "mpegts": ".mts", "avi": ".avi",
+                 "flv": ".flv", "asf": ".wmv", "mp3": ".mp3", "flac": ".flac", "wav": ".wav", "aiff": ".aiff",
+                 "ogg": ".ogg"}
+AUDIO_ONLY_CONTAINER_EXT = {"mp4": ".m4a", "mov": ".m4a"}     # an MP4/MOV with no video stream is an .m4a
+
+def image_format(head: bytes) -> Optional[str]:
+    """The image format from a file's first 12+ bytes (its signature), or None if it is not a known image."""
+    if head.startswith(b"\xff\xd8\xff"): return "jpeg"
+    if head.startswith(b"\x89PNG\r\n\x1a\n"): return "png"
+    if head[:6] in (b"GIF87a", b"GIF89a"): return "gif"
+    if head[:4] == b"RIFF" and head[8:12] == b"WEBP": return "webp"
+    if head[:4] in (b"II*\x00", b"MM\x00*"): return "tiff"
+    if head[:2] == b"BM" and len(head) >= 18 and int.from_bytes(head[14:18], "little") in (12, 40, 52, 56, 64, 108, 124):
+        return "bmp"      # 'BM' alone is too weak a signature; also require a known header size
+    return None
+
+def image_ext(path: Path, data: bytes) -> str:
+    """The extension that stands for what this image really is (from its signature), so a PNG named '.jpg' is
+    stripped/padded/re-encoded as a PNG; the file's own extension when the signature is unknown."""
+    ext, fmt = path.suffix.lower(), image_format(data[:32])
+    return ext if fmt is None or ext in IMAGE_FORMAT_EXTS[fmt] else IMAGE_FORMAT_EXTS[fmt][0]
+
+def true_extension(path: Path, ffprobe: Optional[str]) -> Optional[Tuple[str, str]]:
+    """(extension to rename to, what the file really is) when its extension stands for a different format, e.g. a
+    '.mpeg' that is really MP4, or a '.gif' that is really an MP4 video (as messaging apps save them).
+    None when the extension is right, or the real format is unknown (then nothing is renamed)."""
+    ext = path.suffix.lower()
+    try:
+        with open(path, "rb") as f: head = f.read(32)
+    except OSError:
+        return None
+    fmt = image_format(head)
+    if fmt is not None:
+        return None if ext in IMAGE_FORMAT_EXTS[fmt] else (IMAGE_FORMAT_EXTS[fmt][0], IMAGE_FORMAT_NAMES[fmt])
+    real, has_video = probe_container(path, ffprobe)
+    if real is None or (ext in VIDEO_EXTS | AUDIO_EXTS and same_container(real, ext)):
+        return None
+    new = (None if has_video else AUDIO_ONLY_CONTAINER_EXT.get(real)) or CONTAINER_EXT.get(real)
+    if new is None or new == ext:
+        return None
+    return new, CONTAINER_NAMES.get(real, real)
 
 def remux(path: Path, tmp: Path, ffmpeg: str, ffprobe: Optional[str], out_args: List[str],
           mp4_args: Optional[List[str]] = None, timeout: int = 3600):
@@ -823,7 +902,7 @@ def remux(path: Path, tmp: Path, ffmpeg: str, ffprobe: Optional[str], out_args: 
     Returns (completed process, notes for the log, real container)."""
     force, real = container_override(path, ffprobe)
     notes = [f"file is really {CONTAINER_NAMES.get(real, real)} although named '{path.suffix}' (kept as "
-             f"{CONTAINER_NAMES.get(real, real)}, name unchanged)"] if force else []
+             f"{CONTAINER_NAMES.get(real, real)}, name unchanged)"] if force and str(path) not in _REAL_EXT else []
     family = force or EXT_CONTAINER.get(path.suffix.lower())
     extra = (mp4_args or []) if family in ("mp4", "mov") else []
     fmt = ["-f", force] if force else []
@@ -833,9 +912,11 @@ def remux(path: Path, tmp: Path, ffmpeg: str, ffprobe: Optional[str], out_args: 
     if failed and any(h.lower() in r.stderr.decode("utf-8", "replace").lower() for h in _TIMESTAMP_HINTS):
         discard(tmp)
         r2 = run_cmd(base + ["-fflags", "+genpts", "-i", str(path)] + out_args + extra + fmt
-                     + ["-avoid_negative_ts", "make_zero", "-max_interleave_delta", "0", str(tmp)], timeout=timeout)
+                     + ["-bsf", FIX_DURATIONS_BSF, "-avoid_negative_ts", "make_zero", "-max_interleave_delta", "0",
+                        str(tmp)], timeout=timeout)
         if r2.returncode == 0 and tmp.exists() and tmp.stat().st_size > 0:
-            notes.append("timestamps regenerated (the container writer refused the original ones)")
+            notes.append("timestamps regenerated and invalid packet durations repaired, as the container writer "
+                         "refused the original ones")
         r = r2
     return r, notes, real
 
@@ -896,10 +977,11 @@ def _pillow_reencode_options(im: Image.Image, ext: str) -> List[dict]:
     return []
 
 def reencode_image_worker(path_str: str, jpegtran: Optional[str], strip_chosen: bool) -> Tuple[str, str, str]:
-    path, ext = Path(path_str), Path(path_str).suffix.lower()
+    path = Path(path_str)
     tmp = tmp_path_for(path)
     try:
         st, data = path.stat(), path.read_bytes()
+        ext = image_ext(path, data)
         if ext in JPEG_EXTS:
             if mozjpeg_lossless is None and not jpegtran:
                 return path_str, "skipped", "no lossless JPEG optimiser available (no lossy fallback is used)"
@@ -978,7 +1060,7 @@ def audio_codec(path: Path, ffprobe: str) -> Optional[str]:
 
 def reencode_audio(path: Path, ffmpeg: str, ffprobe: str) -> Tuple[str, str]:
     """Lossless sources -> FLAC, verified sample-for-sample. Lossy sources can't be re-encoded bit-exactly."""
-    ext = path.suffix.lower()
+    ext = kind_ext(path)                 # its real format when a wrong extension was kept
     if ext not in LOSSLESS_AUDIO_EXTS and not (ext == ".m4a" and audio_codec(path, ffprobe) == "alac"):
         return "skipped", "lossy audio cannot be re-encoded bit-exactly (the metadata strip alone changes its hash)"
     final = path if ext == ".flac" else free_name(path.with_suffix(".flac"))
@@ -1112,12 +1194,12 @@ IMAGE_PADDERS = {".jpg": pad_jpeg, ".jpeg": pad_jpeg, ".jfif": pad_jpeg, ".png":
 
 def pad_image_worker(path_str: str) -> Tuple[str, str, str]:
     path = Path(path_str)
-    padder = IMAGE_PADDERS.get(path.suffix.lower())
-    if padder is None:
-        return path_str, "skipped", "padding not supported for this format; hash NOT made unique"
     tmp = tmp_path_for(path)
     try:
         st, data = path.stat(), path.read_bytes()
+        padder = IMAGE_PADDERS.get(image_ext(path, data))
+        if padder is None:
+            return path_str, "skipped", "padding not supported for this format; hash NOT made unique"
         new = padder(data)
         if not same_pixels(data, new) or exif_orientation(new) != exif_orientation(data):
             return path_str, "failed", "padding verification failed; original kept"
@@ -1221,6 +1303,8 @@ class Options:
     unique_hash: bool = True           # add 16 random bytes to every file: hashes never match anyone else's
     rename: bool = False
     hash_report: bool = True           # sha256 every file before and after, list the unchanged ones
+    fix_extensions: bool = True        # wrong extension: True = rename to the real one; False = keep the name.
+                                       # Either way every file is processed as what it really is (with any file step)
     phash_threshold: int = DEFAULT_PHASH_THRESHOLD
     dhash_img_threshold: int = DEFAULT_DHASH_THRESHOLD_IMG
     dhash_vid_threshold: int = DEFAULT_DHASH_THRESHOLD_VID
@@ -1231,6 +1315,7 @@ class Options:
     def planned_steps(self) -> List[str]:
         steps = []
         if self.merge_folders or self.folder_prefix: steps.append("Folder merge")
+        if self.processes_files: steps.append("Extension fix" if self.fix_extensions else "Extension check")
         if self.hash_report and self.changes_hashes: steps.append("Hashing (before)")
         if self.strip: steps.append("Metadata strip")
         if self.dedupe: steps.append("Deduplication")
@@ -1243,6 +1328,11 @@ class Options:
     @property
     def changes_hashes(self) -> bool:
         return self.strip or self.reencode or self.unique_hash
+
+    @property
+    def processes_files(self) -> bool:
+        """Any step that works on the files themselves (the Extension fix/check runs first, so they all see the real format)."""
+        return self.changes_hashes or self.dedupe or self.rename
 
 @dataclass
 class RunContext:
@@ -1401,6 +1491,49 @@ def _report(step: str, root: Path, path: Path, status: str, detail: str, stats: 
         stats.problems.append((rel, status, detail))
     if status == "changed" and (m := _NOTE.search(detail)):
         stats.notes += [(rel, note) for note in m.group(1).split("; ")]
+
+def step_fix_extensions(root: Path, tools: Tools, ctx: RunContext, rename: bool = True) -> StepStats:
+    """Find every file whose extension is not its real format (by content). rename=True: give it the right extension.
+    rename=False: keep its name, and record its real format so the later steps still process it as what it is.
+    Nothing else about the file changes (same bytes, same dates)."""
+    step = "Extension fix" if rename else "Extension check"
+    stats, files = StepStats(), media_files(root)
+    log.info(f"=== STEP: {step} ({len(files)} files) ===")
+    if not tools.ffprobe:
+        log.warning("ffprobe not found: only image extensions are checked; video/audio extensions are left as they are")
+    with ThreadPoolExecutor(max_workers=min(4, CPU_COUNT)) as tpool:
+        futs = {tpool.submit(true_extension, p, tools.ffprobe): p for p in files}
+        for fut in _drain(futs, ctx, step):
+            path = futs[fut]
+            try:
+                found = fut.result()
+            except Exception as e:
+                log.warning(f"EXTENSION | {_rel(root, path)} | could not be checked ({type(e).__name__}: {e}); name kept")
+                stats.add("unchanged")
+                continue
+            if not found:
+                stats.add("unchanged")
+                continue
+            new_ext, real = found
+            if not rename:
+                _REAL_EXT[str(path)] = new_ext
+                stats.add("changed")
+                log.info(f"EXTENSION | {_rel(root, path)} | is really {real}; name kept as asked, processed as {real}")
+                stats.notes.append((_rel(root, path), f"is really {real} although named '{path.suffix}'; name kept "
+                                                      f"as asked, processed as {real}"))
+                continue
+            dst = free_name(path.with_suffix(new_ext))
+            try:
+                path.rename(dst)
+            except OSError as e:
+                _REAL_EXT[str(path)] = new_ext
+                _report("EXTENSION", root, path, "failed", f"is really {real}, but could not be renamed to "
+                        f"'{new_ext}' ({e}); name kept, later steps still treat it as {real}", stats)
+                continue
+            stats.add("changed")
+            log.info(f"EXTENSION | {_rel(root, path)} | renamed to {dst.name} (the file is really {real})")
+            stats.notes.append((_rel(root, dst), f"was named '{path.name}' but is really {real}; renamed to '{dst.name}'"))
+    return stats
 
 def step_merge(root: Path, opts: Options, ctx: RunContext) -> str:
     step = "Folder merge"
@@ -1607,6 +1740,20 @@ def run_pipeline(root: Path, opts: Options, progress: Optional[ProgressFn] = Non
         if opts.merge_folders or opts.folder_prefix:
             current = "Folder merge"
             results.append(f"Folder merge    : {step_merge(root, opts, ctx)}")
+        _REAL_EXT.clear()
+        if opts.processes_files:
+            current = "Extension fix" if opts.fix_extensions else "Extension check"
+            stats = step_fix_extensions(root, tools, ctx, rename=opts.fix_extensions)
+            summary.add_stats(current, stats)
+            if opts.fix_extensions:
+                results.append(f"Extension fix   : {stats.changed} file(s) renamed to their real extension"
+                               + (f", {stats.failed} could not be renamed" if stats.failed else ""))
+            else:
+                results.append(f"Extension check : {stats.changed} file(s) with a wrong extension, names kept as "
+                               f"asked; each is processed as what it really is")
+            files = media_files(root)        # counted again: by real format, under the corrected names
+            summary.files_at_start = {"images": sum(map(is_image, files)), "videos": sum(map(is_video, files)),
+                                      "audio": sum(map(is_audio, files))}
         report = opts.hash_report and opts.changes_hashes
         current = "Hashing (before)"
         before = hash_all(root, ctx, "Hashing (before)") if report else {}
@@ -1675,6 +1822,7 @@ def run_pipeline(root: Path, opts: Options, progress: Optional[ProgressFn] = Non
             for line in summary.render(): log.info(line)
         except Exception as e:   # the summary must never hide the real result of the run
             log.warning(f"Could not write the run summary: {type(e).__name__}: {e}")
+        _REAL_EXT.clear()
         _sweep_leftover_temp_dirs()
         if handler:
             log.removeHandler(handler)

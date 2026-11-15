@@ -132,6 +132,14 @@ def main():
     print(f"   The oldest copy is kept; duplicates go to '{core.DUP_DIRNAME}', unreadable files to '{core.CORRUPT_DIRNAME}'.")
     opts.dedupe = ask_yes_no("   Deduplication needed?")
 
+    if opts.processes_files:
+        print("\ne2) WRONG FILE EXTENSIONS")
+        print("   Runs first: renames any file whose extension is not what it really is (e.g. a .mpeg that is")
+        print("   really an MP4, a .gif that is really a video) to the right extension. Content NOT changed.")
+        print("   No = keep the names as they are; each file is still processed as what it really is.")
+        if not tools.ffprobe: print("   NOTE: ffprobe missing -> only image extensions are checked.")
+        opts.fix_extensions = ask_yes_no("   Fix wrong file extensions?")
+
     if opts.changes_hashes:
         print("\nf) HASH CHECK")
         print("   SHA-256 of every file before and after; lists any file whose hash did NOT change.")
