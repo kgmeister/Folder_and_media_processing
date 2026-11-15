@@ -47,20 +47,48 @@ def section(number: int, title: str, body: ft.Control) -> ft.Card:
                    ft.Text(title, size=18, weight=ft.FontWeight.W_600)], spacing=10)
     return ft.Card(ft.Container(ft.Column([head, body], spacing=12), padding=16))
 
-def option(checkbox: ft.Checkbox, description: str, tag: Optional[ft.Control] = None,
-           below: Optional[ft.Control] = None, narrow: bool = False) -> ft.Column:
-    """narrow (phone): the tag goes on its own line under the checkbox, lined up with the description. Side by side
-    it runs off a portrait phone screen, more so with Android's larger font sizes."""
-    indent = lambda c: ft.Container(c, padding=ft.Padding.only(left=40))
-    if tag and narrow:
-        rows = [checkbox, indent(ft.Row([tag]))]
-    else:
-        rows = [ft.Row([checkbox, tag] if tag else [checkbox], spacing=8,
-                       vertical_alignment=ft.CrossAxisAlignment.CENTER)]
-    rows.append(indent(ft.Text(description, size=12, color=ft.Colors.ON_SURFACE_VARIANT)))
-    if below:
-        rows.append(indent(below))
-    return ft.Column(rows, spacing=2)
+OPTION_TITLE_DISABLED = ft.Colors.with_opacity(0.38, ft.Colors.ON_SURFACE)
+
+def option(checkbox: ft.Checkbox, summary: str, details: str, tag: Optional[ft.Control] = None,
+           below: Optional[ft.Control] = None) -> ft.Row:
+    """Checkbox on the left; title, tag and a one-line summary stacked tightly on the right, and a chevron on the
+    far right that shows or hides the full explanation. The title is not the checkbox's own label: a labelled
+    checkbox sits in a 40-48 px tap-target row, which left a wide gap above the text. The tag wraps under the title
+    only when the line is too narrow. Tapping the title or summary toggles the box; the title Text is kept in
+    checkbox.data so sync_option_titles() can grey it out when the box is disabled."""
+    title = ft.Text(checkbox.label, size=15)
+    checkbox.label, checkbox.data = None, title
+    checkbox.visual_density = ft.VisualDensity.COMPACT      # same 40 px box on phone and PC, so the padding fits
+
+    def toggle(e):
+        if not checkbox.disabled:
+            checkbox.value = not checkbox.value
+            if checkbox.on_change:
+                checkbox.on_change(None)
+
+    head = ft.Row([title, tag] if tag else [title], wrap=True, spacing=8, run_spacing=4,
+                  vertical_alignment=ft.CrossAxisAlignment.CENTER)
+    text = ft.Container(ft.Column([head, ft.Text(summary, size=12, color=ft.Colors.ON_SURFACE_VARIANT)],
+                                  spacing=2),
+                        padding=ft.Padding.only(top=9), on_click=toggle)   # centres the title on the 40 px box
+    more = ft.Container(ft.Text(details, size=12, color=ft.Colors.ON_SURFACE_VARIANT),
+                        bgcolor=ft.Colors.SURFACE_CONTAINER_HIGHEST, border_radius=8,
+                        padding=ft.Padding.symmetric(horizontal=10, vertical=8), visible=False)
+
+    def show_more(e):
+        more.visible = expand_btn.selected = not more.visible
+        more.update()
+        expand_btn.update()
+
+    expand_btn = ft.IconButton(icon=ft.Icons.EXPAND_MORE, selected_icon=ft.Icons.EXPAND_LESS, selected=False,
+                               icon_size=20, icon_color=ft.Colors.ON_SURFACE_VARIANT,
+                               visual_density=ft.VisualDensity.COMPACT, tooltip="More details", on_click=show_more)
+    return ft.Row([checkbox, ft.Column([text, more, below] if below else [text, more], spacing=6, expand=True),
+                   expand_btn], spacing=4, vertical_alignment=ft.CrossAxisAlignment.START)
+
+def sync_option_titles(checkboxes) -> None:
+    for c in checkboxes:
+        c.data.color = OPTION_TITLE_DISABLED if c.disabled else None
 
 def main(page: ft.Page):
     page.title = APP_TITLE
@@ -258,51 +286,69 @@ def main(page: ft.Page):
     cb_hash = ft.Checkbox(label="Hash check" if mobile else "Hash check: list any file whose content hash did NOT change",
                           value=True, disabled=True)
 
-    num = lambda label, v: ft.TextField(label=label, value=str(v), width=140, dense=True,
-                                        input_filter=ft.NumbersOnlyInputFilter())
+    # Phone: a two-column grid that fills the width (a centred single column of narrow boxes looked stranded).
+    # PC: fixed-width boxes in one wrapping row.
+    num = lambda label, v: ft.TextField(label=label, value=str(v), dense=True, width=None if mobile else 140,
+                                        col=6 if mobile else None, input_filter=ft.NumbersOnlyInputFilter())
     f_phash = num("pHash threshold", core.DEFAULT_PHASH_THRESHOLD)
     f_dimg = num("dHash (images)", core.DEFAULT_DHASH_THRESHOLD_IMG)
     f_dvid = num("dHash (videos)", core.DEFAULT_DHASH_THRESHOLD_VID)
     f_hsize = num("Hash size", core.DEFAULT_HASH_SIZE)
     f_frames = num("Frames per video", core.DEFAULT_NUM_FRAMES)
+    thresholds = [f_phash, f_dimg, f_dvid, f_hsize, f_frames]
     advanced = ft.ExpansionTile(
         title=ft.Text("Advanced: duplicate detection thresholds", size=13),
         subtitle=ft.Text("Defaults are the tested values from v7. Lower = stricter.", size=12),
-        controls=[ft.Row([f_phash, f_dimg, f_dvid, f_hsize, f_frames], wrap=True, spacing=10)],
-        controls_padding=ft.Padding.only(left=16, bottom=8), dense=True)
+        controls=[ft.ResponsiveRow(thresholds, spacing=12, run_spacing=16) if mobile else
+                  ft.Row(thresholds, wrap=True, spacing=10, run_spacing=16)],
+        # top padding: room for the outlined fields' floating labels, which were clipped against the header
+        controls_padding=ft.Padding.only(left=16, right=16, top=12, bottom=12),
+        expanded_cross_axis_alignment=ft.CrossAxisAlignment.START, dense=True)
 
+    tag = lambda: badge("changes file hash")
+    # Summaries stay within about 40 characters so they fit on one line on a portrait phone.
     options_col = ft.Column([
-        option(cb_merge, "Moves the media in each top-level '@name' folder into 'name'. Never overwrites: "
-                         "clashing names get _1, _2... Non-media and subfolders stay in '@name'.", below=prefix_field),
-        option(cb_fixext, "Before the other steps, renames any file whose extension is not what it really is (for "
-                          "example a .mpeg that is really an MP4, or a .gif that is really a video) to the right "
-                          "extension. The content is not changed. Unticked: names are kept as they are, and each "
-                          "file is still processed as what it really is."),
-        option(cb_strip, "Removes EXIF (GPS, camera serial, dates), XMP, IPTC, comments, embedded thumbnails, "
-                         "video/audio tags, chapters, cover art and GPS telemetry. Lossless: pixels, frames and "
-                         "samples are untouched; orientation and colour profile are kept. Files that had no "
-                         "metadata stay byte-identical.", badge("changes file hash"), narrow=mobile),
-        option(cb_dedupe, "Perceptual hashing (pHash + dHash, Hamming distance) within each folder. The oldest copy "
-                          f"is kept; duplicates move to '{core.DUP_DIRNAME}', unreadable files to "
-                          f"'{core.CORRUPT_DIRNAME}'."),
-        option(cb_reencode, "Rewrites every file except JPEGs (not available on a phone); decoded pixels/frames/samples "
-                            "stay bit-identical (verified). PNG/GIF/TIFF about the same size, lossy WebP larger. VIDEO "
-                            "becomes FFV1 .mkv: typically 5-20x LARGER, and slow on a phone." if mobile else
-                            "Rewrites every file; decoded pixels/frames/samples stay bit-identical (verified). "
-                            "JPEG a few % smaller (built-in mozjpeg), PNG/GIF/TIFF about the same, lossy WebP larger. "
-                            "VIDEO becomes FFV1 .mkv: typically 5-20x LARGER and slow.",
-               badge("changes file hash"), narrow=mobile),
-        option(cb_unique, "Adds 16 random bytes (OS cryptographic random generator, fresh for every file on every "
-                          "run) where viewers ignore them. Strip and re-encode alone are deterministic: two people "
-                          "processing the same photo would get the same hash. With this, nobody else - and no other "
-                          "run - ever produces the same file. No personal data is added.",
-               badge("changes file hash"), narrow=mobile),
-        option(cb_rename, "'<folder name> (N).<ext>', numbered 1..N oldest first per extension, no gaps. Removes "
-                          "identifying original names such as IMG_20250101_123456.jpg."),
-        option(cb_hash, ("Lists any file whose content hash did NOT change. " if mobile else "")
-                        + "SHA-256 of every file before and after the run. Reads every file twice."),
+        option(cb_merge, "Merge each '@name' folder into 'name'.",
+               "If you have folders like '@Holiday' and 'Holiday' side by side, the photos and videos in '@Holiday' "
+               "are moved into 'Holiday'. Nothing is ever overwritten: if a name is already taken, the moved file "
+               "gets _1, _2 and so on added. Other files and subfolders are left in '@Holiday'.", below=prefix_field),
+        option(cb_fixext, "Rename files to their true extension.",
+               "Sometimes a file's ending does not match what it really is, for example a video saved as '.gif', or "
+               "an MP4 named '.mpeg'. This gives such files the right ending so other apps open them properly. The "
+               "file itself is not changed. If you untick this, names stay as they are, and the app still handles "
+               "each file correctly."),
+        option(cb_strip, "Remove EXIF, GPS and other metadata.",
+               "Photos and videos carry hidden information: where they were taken (GPS), when, which camera or phone "
+               "was used, plus small preview images and tags. This removes all of it. The picture, video and sound "
+               "themselves are not touched, and photos keep their correct rotation and colours.", tag()),
+        option(cb_dedupe, f"Move look-alike copies to '{core.DUP_DIRNAME}'.",
+               "Compares what photos and videos look like, so copies are found even if they were resized or saved "
+               "again. Only files in the same folder are compared. The oldest copy stays where it is; the others "
+               f"move to a '{core.DUP_DIRNAME}' folder (nothing is deleted). Files that cannot be opened move to "
+               f"'{core.CORRUPT_DIRNAME}'."),
+        option(cb_reencode, "Lossless rewrite; videos get much larger.",
+               "Saves every file again in a new form while keeping the picture and sound exactly the same (the app "
+               "checks this). JPEG photos are skipped on a phone. Most images stay about the same size. Videos are "
+               "saved in a lossless .mkv format and usually become 5 to 20 times LARGER, and this is slow on a phone."
+               if mobile else
+               "Saves every file again in a new form while keeping the picture and sound exactly the same (the app "
+               "checks this). JPEG photos get a little smaller; most other images stay about the same size. Videos "
+               "are saved in a lossless .mkv format and usually become 5 to 20 times LARGER, and this is slow.",
+               tag()),
+        option(cb_unique, "Add random bytes so no hash ever repeats.",
+               "A file's 'hash' is like its fingerprint. Without this option, two people cleaning the same photo "
+               "would end up with identical files that could be matched to each other. This adds a little random "
+               "data that viewers ignore, so every file is one of a kind, every time. Nothing about you is added.",
+               tag()),
+        option(cb_rename, "Name files '<folder> (N)', oldest first.",
+               "Original names often give away the date and the device, like 'IMG_20250101_123456.jpg'. Files are "
+               "renamed after their folder instead, for example 'Holiday (1).jpg', 'Holiday (2).jpg', numbered from "
+               "oldest to newest."),
+        option(cb_hash, "List files whose hash did NOT change." if mobile else "Fingerprint every file, before and after.",
+               "Takes a fingerprint (hash) of every file before and after the run, and lists any file that did not "
+               "change, so you can see what was left as it was. It reads every file twice, so it adds some time."),
         advanced,
-    ], spacing=10)
+    ], spacing=14)
 
     # ---------------- 3. Run ----------------
     start_btn = ft.FilledButton("Start", icon=ft.Icons.PLAY_ARROW, disabled=True)
@@ -363,6 +409,7 @@ def main(page: ft.Page):
         for c in (cb_merge, cb_strip, cb_dedupe, cb_reencode, cb_unique, cb_rename, choose_btn, f_phash, f_dimg,
                   f_dvid, f_hsize, f_frames, log_change_btn, log_reset_btn, install_btn):
             c.disabled = running
+        sync_option_titles((cb_merge, cb_fixext, cb_strip, cb_dedupe, cb_reencode, cb_unique, cb_rename, cb_hash))
         steps = opts.planned_steps()
         show_log_dir()
         start_btn.disabled = running or state["root"] is None or not steps
