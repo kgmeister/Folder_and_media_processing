@@ -278,7 +278,7 @@ def test_log_ends_with_summary_of_files_not_processed(tmp_path):
     assert "Outcome         : Finished" in summary and "Files at start  : 5 (5 images" in summary
     assert "4 of 5 file(s) processed as specified, 1 NOT processed as specified" in summary
     assert "Files NOT processed as specified (1)" in summary and "| broken.jpg" not in summary
-    block = summary[summary.index("Album/broken.jpg"):]
+    block = summary[summary.index(os.path.join("Album", "broken.jpg")):]
     assert "Metadata strip  FAILED" in block and "Deduplication   CORRUPT" in block
     assert any(r.startswith("Problems        : 1 file(s)") for r in results)
 

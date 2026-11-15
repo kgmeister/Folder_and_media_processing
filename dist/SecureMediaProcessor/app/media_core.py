@@ -741,7 +741,7 @@ DEMUXER_CONTAINER = {"mov,mp4,m4a,3gp,3g2,mj2": "mp4", "matroska,webm": "matrosk
 CONTAINER_NAMES = {"mp4": "MP4", "mov": "QuickTime MOV", "matroska": "Matroska", "mpeg": "MPEG program stream",
                    "mpegts": "MPEG transport stream", "avi": "AVI", "flv": "FLV", "asf": "ASF/WMV", "mp3": "MP3",
                    "flac": "FLAC", "wav": "WAV", "aiff": "AIFF", "ogg": "Ogg"}
-_FF_LINE = re.compile(r"^(?:\[[^\]]*\]\s*)*?(?:\[(?P<ctx>[^\]@]+?) @ 0x[0-9a-fA-F]+\]\s*)?"
+_FF_LINE = re.compile(r"^(?:\[[^\]]*\]\s*)*?(?:\[(?P<ctx>[^\]@]+?) @ (?:0x)?[0-9a-fA-F]+\]\s*)?"   # Windows builds print addresses without 0x
                       r"(?:\[(?P<lvl>panic|fatal|error|warning)\]\s*)?(?P<msg>.*)$")
 _FF_GENERIC = ("Last message repeated", "Task finished with error code", "Terminating thread with return code",
                "Error muxing a packet", "Error submitting a packet to the muxer", "Conversion failed",
