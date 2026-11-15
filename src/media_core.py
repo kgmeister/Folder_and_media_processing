@@ -40,9 +40,9 @@ There is no mozjpeg for Android: JPEGs are not re-encoded (everything else works
 """
 import os, sys, shutil, tempfile, time, uuid, logging, importlib.util, threading
 import subprocess as _subprocess
-import io, json, struct, zlib, hashlib
+import io, json, re, struct, zlib, hashlib
 from pathlib import Path
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Tuple, Optional, Union
 from concurrent.futures import Executor, ThreadPoolExecutor, ProcessPoolExecutor, as_completed
 
@@ -248,9 +248,16 @@ class StepStats:
     unchanged: int = 0
     skipped: int = 0
     failed: int = 0
+    problems: List[Tuple[str, str, str]] = field(default_factory=list, repr=False)   # (file, status, reason)
+    notes: List[Tuple[str, str]] = field(default_factory=list, repr=False)           # (file, note) on changed files
 
     def add(self, status: str):
         setattr(self, status, getattr(self, status) + 1)
+
+    def skip_all(self, root: Path, files: List[Path], reason: str):
+        for p in files:
+            self.skipped += 1
+            self.problems.append((_rel(root, p), "skipped", reason))
 
     def __str__(self):
         return f"changed={self.changed} unchanged={self.unchanged} skipped={self.skipped} failed={self.failed}"
@@ -442,7 +449,8 @@ def find_duplicates(entries: List[FileEntry], hashes: Dict[Path, Hashes], pth: i
             trees[typ].add(key, fe)
     return dups
 
-def run_dedupe(folder: Path, dup_dir: Path, corrupt_dir: Path, pool: Executor, args) -> Tuple[int, int]:
+def run_dedupe(folder: Path, dup_dir: Path, corrupt_dir: Path, pool: Executor, args,
+               corrupt_out: Optional[List[Path]] = None) -> Tuple[int, int]:
     entries = _collect_folder(folder)
     tools = find_tools()                   # only programs that actually run (never a blocked ffmpeg)
     ffmpeg, ffprobe = tools.ffmpeg, tools.ffprobe
@@ -458,6 +466,7 @@ def run_dedupe(folder: Path, dup_dir: Path, corrupt_dir: Path, pool: Executor, a
             log.info(f"CORRUPT | unreadable, moved to {CORRUPT_DIRNAME}: {path}")
             safe_move(path, corrupt_dir)
             n_bad += 1
+            if corrupt_out is not None: corrupt_out.append(path)
         elif h is not None:
             hashes[path] = h
 
@@ -720,17 +729,127 @@ def strip_image_worker(path_str: str) -> Tuple[str, str, str]:
 # Data streams (e.g. GoPro/drone GPS telemetry, timecode) are deliberately NOT mapped, so they are dropped.
 AV_STRIP_MAPS = ["0:V?", "0:a?", "0:s?"]
 
-def strip_av(path: Path, ffmpeg: str) -> Tuple[str, str]:
+# ---------- ffmpeg stream copy: the right container, a retry for bad timestamps, and the reason when it fails ----------
+# Container family ffmpeg picks from the file name, and the muxer to use for each container ffprobe can detect.
+EXT_CONTAINER = {".mp4": "mp4", ".m4v": "mp4", ".m4a": "mp4", ".mov": "mp4", ".3gp": "mp4",
+                 ".mkv": "matroska", ".webm": "matroska", ".mpg": "mpeg", ".mpeg": "mpeg", ".avi": "avi",
+                 ".flv": "flv", ".wmv": "asf", ".mp3": "mp3", ".flac": "flac", ".wav": "wav",
+                 ".aiff": "aiff", ".aif": "aiff", ".ogg": "ogg", ".opus": "ogg"}
+DEMUXER_CONTAINER = {"mov,mp4,m4a,3gp,3g2,mj2": "mp4", "matroska,webm": "matroska", "mpeg": "mpeg",
+                     "mpegts": "mpegts", "avi": "avi", "flv": "flv", "asf": "asf", "mp3": "mp3", "flac": "flac",
+                     "wav": "wav", "aiff": "aiff", "ogg": "ogg"}
+CONTAINER_NAMES = {"mp4": "MP4", "mov": "QuickTime MOV", "matroska": "Matroska", "mpeg": "MPEG program stream",
+                   "mpegts": "MPEG transport stream", "avi": "AVI", "flv": "FLV", "asf": "ASF/WMV", "mp3": "MP3",
+                   "flac": "FLAC", "wav": "WAV", "aiff": "AIFF", "ogg": "Ogg"}
+_FF_LINE = re.compile(r"^(?:\[[^\]]*\]\s*)*?(?:\[(?P<ctx>[^\]@]+?) @ 0x[0-9a-fA-F]+\]\s*)?"
+                      r"(?:\[(?P<lvl>panic|fatal|error|warning)\]\s*)?(?P<msg>.*)$")
+_FF_GENERIC = ("Last message repeated", "Task finished with error code", "Terminating thread with return code",
+               "Error muxing a packet", "Error submitting a packet to the muxer", "Conversion failed",
+               "Error while filtering", "Error closing", "Nothing was written into output file",
+               "Error initializing output stream", "Could not write header")
+_TIMESTAMP_HINTS = ("dts", "pts", "timestamp", "out of range", "duration", "Error submitting a packet to the muxer")
+
+def ffmpeg_error_summary(stderr: bytes, limit: int = 400) -> str:
+    """The lines of ffmpeg's output that say WHY it failed: errors before warnings, specific before generic,
+    without memory addresses or repeats. Taken from the start, so the reason is never cut off."""
+    specific, generic, warnings, seen = [], [], [], set()
+    for raw in stderr.decode("utf-8", "replace").splitlines():
+        m = _FF_LINE.match(raw.strip())
+        msg = re.sub(r"\s+", " ", m.group("msg")).strip() if m else raw.strip()
+        if not msg or msg.startswith("Last message repeated") or msg in seen: continue
+        seen.add(msg)
+        if m and m.group("lvl") == "warning": warnings.append(msg)
+        elif any(msg.startswith(g) for g in _FF_GENERIC): generic.append(msg)
+        else: specific.append(msg)
+    lines = (specific[:3] or generic[:2]) + warnings[:2]
+    out = " / ".join(lines) or "no error message (exit code only)"
+    return out if len(out) <= limit else out[:limit - 3] + "..."
+
+def explain_ffmpeg_error(msg: str, real: Optional[str] = None, ext: str = "") -> str:
+    """One plain sentence: why ffmpeg could not rewrite the file."""
+    low = msg.lower()
+    if "no space left" in low:
+        return "not enough free storage to write the temporary copy"
+    if "permission denied" in low or "read-only file system" in low:
+        return "no permission to write in this folder"
+    if any(k in low for k in ("moov atom not found", "invalid data found when processing input", "end of file",
+                              "truncat", "error while decoding")):
+        return "the file is damaged or incomplete, so it could not be read to the end"
+    if any(k in low for k in ("unsupported audio codec", "unsupported video codec", "could not find tag for codec",
+                              "not currently supported in container", "codec not supported", "incorrect codec parameters")):
+        named = CONTAINER_NAMES.get(EXT_CONTAINER.get(ext, ""), ext)
+        return (f"its audio/video formats cannot be stored in the {named} container that the '{ext}' extension "
+                f"stands for" + (f" (the file itself is {CONTAINER_NAMES.get(real, real)})" if real else ""))
+    if any(k in low for k in ("dts", "pts", "timestamp", "out of range", "packet duration")):
+        return ("its timestamps are irregular (common in files re-saved by messaging apps) and the container "
+                "writer refuses them, even after the timestamps were regenerated")
+    if "error submitting a packet to the muxer" in low or "error muxing a packet" in low:
+        return ("the container writer rejected some of its audio/video packets (usually irregular timestamps "
+                "from the app that saved it), even after the timestamps were regenerated")
+    if "no error message" in low:
+        return "ffmpeg stopped without saying why"
+    return "ffmpeg could not copy its streams into a new file"
+
+def ffmpeg_failure(r, real: Optional[str], ext: str) -> str:
+    msg = ffmpeg_error_summary(r.stderr)
+    return f"{explain_ffmpeg_error(msg, real, ext)} [ffmpeg: {msg}]; original kept"
+
+def real_container(path: Path, ffprobe: Optional[str]) -> Optional[str]:
+    """The container the file really is (from its content, not its name), as a muxer name; None if unknown."""
+    if not ffprobe: return None
+    r = run_cmd([ffprobe, "-v", "error", "-show_entries", "format=format_name:format_tags=major_brand",
+                 "-of", "json", str(path)], timeout=120)
+    if r.returncode != 0: return None
+    try: fmt = json.loads(r.stdout.decode("utf-8", "replace")).get("format", {})
+    except ValueError: return None
+    family = DEMUXER_CONTAINER.get(fmt.get("format_name", ""))
+    if family == "mp4" and str(fmt.get("tags", {}).get("major_brand", "")).strip() == "qt":
+        return "mov"
+    return family
+
+def container_override(path: Path, ffprobe: Optional[str]) -> Tuple[Optional[str], Optional[str]]:
+    """(muxer to force, real container): a muxer only when the name's extension stands for another container,
+    e.g. an MP4 with AAC audio named .mpeg, which ffmpeg would otherwise write as MPEG-PS (which cannot hold AAC)."""
+    real = real_container(path, ffprobe)
+    named = EXT_CONTAINER.get(path.suffix.lower())
+    same = real is None or real == named or (real == "mov" and named == "mp4")
+    return (None if same else real), real
+
+def remux(path: Path, tmp: Path, ffmpeg: str, ffprobe: Optional[str], out_args: List[str],
+          mp4_args: Optional[List[str]] = None, timeout: int = 3600):
+    """Stream-copy `path` into `tmp` (out_args = maps/codec/metadata options). Keeps the file's real container
+    even when its extension says otherwise; if the container writer rejects the packets' timestamps, tries once
+    more with regenerated timestamps (the packets themselves are still copied unchanged and verified after).
+    Returns (completed process, notes for the log, real container)."""
+    force, real = container_override(path, ffprobe)
+    notes = [f"file is really {CONTAINER_NAMES.get(real, real)} although named '{path.suffix}' (kept as "
+             f"{CONTAINER_NAMES.get(real, real)}, name unchanged)"] if force else []
+    family = force or EXT_CONTAINER.get(path.suffix.lower())
+    extra = (mp4_args or []) if family in ("mp4", "mov") else []
+    fmt = ["-f", force] if force else []
+    base = [ffmpeg, "-nostdin", "-loglevel", "level+warning", "-y"]
+    r = run_cmd(base + ["-i", str(path)] + out_args + extra + fmt + [str(tmp)], timeout=timeout)
+    failed = r.returncode != 0 or not tmp.exists() or tmp.stat().st_size == 0
+    if failed and any(h.lower() in r.stderr.decode("utf-8", "replace").lower() for h in _TIMESTAMP_HINTS):
+        discard(tmp)
+        r2 = run_cmd(base + ["-fflags", "+genpts", "-i", str(path)] + out_args + extra + fmt
+                     + ["-avoid_negative_ts", "make_zero", "-max_interleave_delta", "0", str(tmp)], timeout=timeout)
+        if r2.returncode == 0 and tmp.exists() and tmp.stat().st_size > 0:
+            notes.append("timestamps regenerated (the container writer refused the original ones)")
+        r = r2
+    return r, notes, real
+
+def strip_av(path: Path, ffmpeg: str, ffprobe: Optional[str] = None) -> Tuple[str, str]:
     tmp = tmp_path_for(path)
     try:
         st = path.stat()
-        cmd = [ffmpeg, "-nostdin", "-v", "error", "-y", "-i", str(path)]
-        for m in AV_STRIP_MAPS: cmd += ["-map", m]
-        cmd += ["-c", "copy", "-map_metadata", "-1", "-map_chapters", "-1",
-                "-fflags", "+bitexact", "-flags:v", "+bitexact", "-flags:a", "+bitexact", str(tmp)]
-        r = run_cmd(cmd, timeout=3600)
+        args = []
+        for m in AV_STRIP_MAPS: args += ["-map", m]
+        args += ["-c", "copy", "-map_metadata", "-1", "-map_chapters", "-1",
+                 "-fflags", "+bitexact", "-flags:v", "+bitexact", "-flags:a", "+bitexact"]
+        r, notes, real = remux(path, tmp, ffmpeg, ffprobe, args)
         if r.returncode != 0 or not tmp.exists() or tmp.stat().st_size == 0:
-            return "failed", f"ffmpeg failed: {r.stderr.decode('utf-8', 'replace').strip()[-300:]}; original kept"
+            return "failed", ffmpeg_failure(r, real, path.suffix.lower())
         before = ffmpeg_streamhash(ffmpeg, path, AV_STRIP_MAPS, copy=True)
         if before is None or before != ffmpeg_streamhash(ffmpeg, tmp, AV_STRIP_MAPS, copy=True):
             return "failed", "verification failed (audio/video packets differ); original kept"
@@ -738,7 +857,8 @@ def strip_av(path: Path, ffmpeg: str) -> Tuple[str, str]:
         if old_hash == new_hash:
             return "unchanged", "no metadata found"
         commit(tmp, path, path, st)
-        return "changed", f"tags/chapters/cover art/data streams removed | sha256 {old_hash[:12]} -> {new_hash[:12]}"
+        note = f" ({'; '.join(notes)})" if notes else ""
+        return "changed", f"tags/chapters/cover art/data streams removed{note} | sha256 {old_hash[:12]} -> {new_hash[:12]}"
     except Exception as e:
         return "failed", f"{type(e).__name__}: {e}; original kept"
     finally:
@@ -1009,21 +1129,19 @@ def pad_image_worker(path_str: str) -> Tuple[str, str, str]:
     finally:
         discard(tmp)
 
-def pad_av(path: Path, ffmpeg: str) -> Tuple[str, str]:
+def pad_av(path: Path, ffmpeg: str, ffprobe: Optional[str] = None) -> Tuple[str, str]:
     """Stream copy of every stream plus one random tag; packets verified identical."""
     tmp = tmp_path_for(path)
     try:
         st = path.stat()
-        cmd = [ffmpeg, "-nostdin", "-v", "error", "-y", "-i", str(path), "-map", "0", "-c", "copy",
-               "-metadata", f"padding={_nonce().hex()}"]
-        if path.suffix.lower() in (".mp4", ".m4v", ".m4a", ".mov", ".3gp"):
-            # use_metadata_tags would also write ffmpeg's read-back of the file-type header as tags, adding another
-            # copy on every pass (+26 bytes each time); clear them; the header itself still carries this information.
-            cmd += ["-metadata", "major_brand=", "-metadata", "minor_version=", "-metadata", "compatible_brands=",
-                    "-movflags", "+use_metadata_tags"]
-        r = run_cmd(cmd + [str(tmp)], timeout=3600)
+        args = ["-map", "0", "-c", "copy", "-metadata", f"padding={_nonce().hex()}"]
+        # MP4/MOV: use_metadata_tags would also write ffmpeg's read-back of the file-type header as tags, adding
+        # another copy on every pass (+26 bytes each time); clear them; the header itself still carries this.
+        mp4 = ["-metadata", "major_brand=", "-metadata", "minor_version=", "-metadata", "compatible_brands=",
+               "-movflags", "+use_metadata_tags"]
+        r, notes, real = remux(path, tmp, ffmpeg, ffprobe, args, mp4_args=mp4)
         if r.returncode != 0 or not tmp.exists() or tmp.stat().st_size == 0:
-            return "failed", f"ffmpeg failed: {r.stderr.decode('utf-8', 'replace').strip()[-300:]}; original kept"
+            return "failed", ffmpeg_failure(r, real, path.suffix.lower())
         before = ffmpeg_streamhash(ffmpeg, path, ["0"], copy=True)
         if before is None or before != ffmpeg_streamhash(ffmpeg, tmp, ["0"], copy=True):
             return "failed", "verification failed (packets differ); original kept"
@@ -1031,7 +1149,8 @@ def pad_av(path: Path, ffmpeg: str) -> Tuple[str, str]:
         if old_hash == new_hash:
             return "failed", "padding did not change the bytes; original kept"
         commit(tmp, path, path, st)
-        return "changed", f"added a random padding tag | sha256 {old_hash[:12]} -> {new_hash[:12]}"
+        note = f" ({'; '.join(notes)})" if notes else ""
+        return "changed", f"added a random padding tag{note} | sha256 {old_hash[:12]} -> {new_hash[:12]}"
     except Exception as e:
         return "failed", f"{type(e).__name__}: {e}; original kept"
     finally:
@@ -1267,11 +1386,21 @@ def default_log_path(folder: Optional[Path] = None) -> Path:
     return ensure_dir(Path(folder) if folder else log_dir()) / f"run_{time.strftime('%Y%m%d_%H%M%S')}.txt"
 
 # ---------- Steps ----------
+# Remarks remux() adds to a "changed" detail, e.g. "(file is really MP4 although named '.mpeg' (...)) | sha256 ..."
+_NOTE = re.compile(r"\((file is really .*?|timestamps regenerated .*?)\) \| sha256")
+
+def _rel(root: Path, path: Path) -> str:
+    return str(path.relative_to(root) if path.is_relative_to(root) else path)
+
 def _report(step: str, root: Path, path: Path, status: str, detail: str, stats: StepStats):
     stats.add(status)
-    rel = path.relative_to(root) if path.is_relative_to(root) else path
+    rel = _rel(root, path)
     if status == "changed": log.info(f"{step} | {rel} | {detail}")
-    elif status in ("skipped", "failed"): log.warning(f"{step} {status.upper()} | {rel} | {detail}")
+    elif status in ("skipped", "failed"):
+        log.warning(f"{step} {status.upper()} | {rel} | {detail}")
+        stats.problems.append((rel, status, detail))
+    if status == "changed" and (m := _NOTE.search(detail)):
+        stats.notes += [(rel, note) for note in m.group(1).split("; ")]
 
 def step_merge(root: Path, opts: Options, ctx: RunContext) -> str:
     step = "Folder merge"
@@ -1306,15 +1435,16 @@ def step_strip(root: Path, pool: Executor, tools: Tools, ctx: RunContext) -> Ste
         _report("STRIP", root, Path(path), status, detail, stats)
     if av and not tools.ffmpeg:
         log.warning(f"ffmpeg not found: {len(av)} video/audio files were NOT stripped")
-        stats.skipped += len(av)
+        stats.skip_all(root, av, "ffmpeg not found, so video/audio metadata could not be stripped")
     elif av:
         with ThreadPoolExecutor(max_workers=min(4, CPU_COUNT)) as tpool:
-            futs = {tpool.submit(strip_av, p, tools.ffmpeg): p for p in av}
+            futs = {tpool.submit(strip_av, p, tools.ffmpeg, tools.ffprobe): p for p in av}
             for fut in _drain(futs, ctx, f"{step} (video/audio)"):
                 _report("STRIP", root, futs[fut], *fut.result(), stats)
     return stats
 
-def step_dedupe(root: Path, pool: Executor, opts: Options, tools: Tools, ctx: RunContext) -> Tuple[int, int]:
+def step_dedupe(root: Path, pool: Executor, opts: Options, tools: Tools, ctx: RunContext,
+                corrupt_out: Optional[List[Path]] = None) -> Tuple[int, int]:
     step = "Deduplication"
     log.info(f"=== STEP: {step} ===")
     if not (tools.ffmpeg and tools.ffprobe):
@@ -1330,7 +1460,7 @@ def step_dedupe(root: Path, pool: Executor, opts: Options, tools: Tools, ctx: Ru
             has_media = False
         if has_media:
             log.info(f"Processing: {fld}")
-            n_dup, n_bad = run_dedupe(fld, dup_dir, corrupt_dir, pool, opts)
+            n_dup, n_bad = run_dedupe(fld, dup_dir, corrupt_dir, pool, opts, corrupt_out)
             total_dup += n_dup; total_bad += n_bad
         ctx.tick(step, k, len(folders))
     return total_dup, total_bad
@@ -1347,7 +1477,7 @@ def step_reencode(root: Path, pool: Executor, opts: Options, tools: Tools, strip
         _report("REENCODE", root, Path(path), status, detail, stats)
     if (videos or audio) and not (tools.ffmpeg and tools.ffprobe):
         log.warning(f"ffmpeg/ffprobe not found: {len(videos) + len(audio)} video/audio files were NOT re-encoded")
-        stats.skipped += len(videos) + len(audio)
+        stats.skip_all(root, videos + audio, "ffmpeg/ffprobe not found, so it could not be re-encoded")
         return stats
     av = videos + audio
     ctx.tick(f"{step} (video/audio)", 0, len(av))
@@ -1372,10 +1502,10 @@ def step_pad(root: Path, pool: Executor, tools: Tools, ctx: RunContext) -> StepS
         _report("PADDING", root, Path(path), status, detail, stats)
     if av and not tools.ffmpeg:
         log.warning(f"ffmpeg not found: {len(av)} video/audio files were NOT padded (their hashes are not unique)")
-        stats.skipped += len(av)
+        stats.skip_all(root, av, "ffmpeg not found, so no padding was added (hash NOT made unique)")
     elif av:
         with ThreadPoolExecutor(max_workers=min(4, CPU_COUNT)) as tpool:
-            futs = {tpool.submit(pad_av, p, tools.ffmpeg): p for p in av}
+            futs = {tpool.submit(pad_av, p, tools.ffmpeg, tools.ffprobe): p for p in av}
             for fut in _drain(futs, ctx, f"{step} (video/audio)"):
                 _report("PADDING", root, futs[fut], *fut.result(), stats)
     return stats
@@ -1398,48 +1528,153 @@ def sweep_tmp_files(root: Path):
             log.info(f"Removed leftover temp file from an interrupted run: {p}")
         except OSError: pass
 
+@dataclass
+class RunSummary:
+    """What the end-of-log summary needs: per-step results and every file that was not processed as asked."""
+    root: Path
+    steps: List[str]
+    files_at_start: Dict[str, int] = field(default_factory=dict)
+    lines: List[str] = field(default_factory=list)             # the per-step result lines
+    problems: Dict[str, List[Tuple[str, str, str]]] = field(default_factory=dict)   # file -> [(step, status, reason)]
+    notes: Dict[str, List[Tuple[str, str]]] = field(default_factory=dict)          # file -> [(step, note)]
+    duplicates: int = 0
+    corrupted: int = 0
+    renamed: bool = False
+    outcome: str = "Finished"
+
+    def add_stats(self, step: str, stats: StepStats):
+        for rel, status, reason in stats.problems:
+            self.problems.setdefault(rel, []).append((step, status.upper(), reason))
+        for rel, note in stats.notes:
+            self.notes.setdefault(rel, []).append((step, note))
+
+    def add_problem(self, rel: str, step: str, status: str, reason: str):
+        self.problems.setdefault(rel, []).append((step, status, reason))
+
+    def render(self) -> List[str]:
+        total = sum(self.files_at_start.values())
+        out = ["", "=" * 25 + " RUN SUMMARY " + "=" * 25,
+               f"Folder          : {self.root}",
+               f"Steps           : {', '.join(self.steps) or '(none)'}",
+               f"Outcome         : {self.outcome}",
+               f"Files at start  : {total} ({self.files_at_start.get('images', 0)} images, "
+               f"{self.files_at_start.get('videos', 0)} videos, {self.files_at_start.get('audio', 0)} audio)"]
+        out += [f"  {line}" for line in self.lines if not line.startswith("Problems ")]
+        bad = len(self.problems)            # includes the files moved to Corrupted
+        ok = max(total - bad, 0)
+        out.append(f"Result          : {ok} of {total} file(s) processed as specified, "
+                   f"{bad} NOT processed as specified"
+                   + (f"; {self.duplicates} duplicate(s) moved to {DUP_DIRNAME} (as asked)" if self.duplicates else ""))
+        if self.problems:
+            out += ["", f"--- Files NOT processed as specified ({bad}) ---"]
+            if self.renamed:
+                out.append("(names as they were at the step that reported the problem; the Renaming step ran afterwards)")
+            for rel in sorted(self.problems, key=str.lower):
+                out.append(rel)
+                for step, status, reason in self.problems[rel]:
+                    out.append(f"    {step:<16}{status:<10}: {reason}")
+                for step, note in self.notes.get(rel, []):
+                    out.append(f"    {step:<16}{'NOTE':<10}: {note}")
+        if self.notes and any(rel not in self.problems for rel in self.notes):
+            out += ["", "--- Notes on files that were processed ---"]
+            for rel in sorted((r for r in self.notes if r not in self.problems), key=str.lower):
+                out.append(rel)
+                for step, note in self.notes[rel]:
+                    out.append(f"    {step:<16}{'NOTE':<10}: {note}")
+        if not self.problems and self.outcome == "Finished":
+            out.append("Every file was processed as specified.")
+        out.append("=" * 63)
+        return out
+
 def run_pipeline(root: Path, opts: Options, progress: Optional[ProgressFn] = None,
                  cancel: Optional[threading.Event] = None, log_path: Optional[Path] = None) -> List[str]:
     """Run the selected steps in a fixed order. Returns one summary line per step.
-    Raises Cancelled if `cancel` is set; files already processed keep their verified changes."""
+    Raises Cancelled if `cancel` is set; files already processed keep their verified changes.
+    The log ends with a RUN SUMMARY: per-step counts and every file not processed as asked, with the reason."""
     ctx = RunContext(progress, cancel)
     tools = find_tools()
     handler = setup_file_logger(log_path) if log_path else None
     results: List[str] = []
+    summary = RunSummary(root, opts.planned_steps(), lines=results)
     started = time.time()
+    current = ""
     try:
         log.info(f"Run started on {root} with steps: {', '.join(opts.planned_steps())}")
         sweep_tmp_files(root)
+        start_files = media_files(root)
+        summary.files_at_start = {"images": sum(map(is_image, start_files)), "videos": sum(map(is_video, start_files)),
+                                  "audio": sum(map(is_audio, start_files))}
         if opts.merge_folders or opts.folder_prefix:
+            current = "Folder merge"
             results.append(f"Folder merge    : {step_merge(root, opts, ctx)}")
         report = opts.hash_report and opts.changes_hashes
+        current = "Hashing (before)"
         before = hash_all(root, ctx, "Hashing (before)") if report else {}
         executor = ProcessPoolExecutor if opts.use_processes else ThreadPoolExecutor
         with executor(max_workers=CPU_COUNT) as pool:
             if opts.strip:
-                results.append(f"Metadata strip  : {step_strip(root, pool, tools, ctx)}")
+                current = "Metadata strip"
+                stats = step_strip(root, pool, tools, ctx)
+                summary.add_stats(current, stats)
+                results.append(f"Metadata strip  : {stats}")
             if opts.dedupe:
-                n_dup, n_bad = step_dedupe(root, pool, opts, tools, ctx)
+                current = "Deduplication"
+                corrupt: List[Path] = []
+                n_dup, n_bad = step_dedupe(root, pool, opts, tools, ctx, corrupt)
+                summary.duplicates, summary.corrupted = n_dup, n_bad
+                for p in corrupt:
+                    summary.add_problem(_rel(root, p), current, "CORRUPT",
+                                        f"could not be read/decoded (damaged, incomplete or an unsupported format); "
+                                        f"moved to {CORRUPT_DIRNAME}, so later steps did not process it")
                 results.append(f"Deduplication   : {n_dup} duplicate(s) -> {root / DUP_DIRNAME}, "
                                f"{n_bad} unreadable -> {root / CORRUPT_DIRNAME}")
             if opts.reencode:
-                results.append(f"Lossless re-enc : {step_reencode(root, pool, opts, tools, opts.strip, ctx)}")
+                current = "Lossless re-enc"
+                stats = step_reencode(root, pool, opts, tools, opts.strip, ctx)
+                summary.add_stats("Lossless re-enc", stats)
+                results.append(f"Lossless re-enc : {stats}")
             if opts.unique_hash:
-                results.append(f"Unique padding  : {step_pad(root, pool, tools, ctx)}")
+                current = "Unique padding"
+                stats = step_pad(root, pool, tools, ctx)
+                summary.add_stats(current, stats)
+                results.append(f"Unique padding  : {stats}")
         if opts.rename:
+            current = "Renaming"
             results.append(f"Renaming        : {step_rename(root, ctx)} file(s) renamed")
+            summary.renamed = True
         if report:
+            current = "Hashing (after)"
             after = hash_all(root, ctx, "Hashing (after)")
             same = sorted(p for h, paths in after.items() if h in before for p in paths)
             n_after = sum(len(v) for v in after.values())
             for p in same:
                 log.warning(f"HASH UNCHANGED | {p.relative_to(root)}")
+                why = ("its sha256 is the same as before the run, so it can still be matched to the original"
+                       + ("" if opts.unique_hash else " (no selected step needed to change it)"))
+                if opts.unique_hash or _rel(root, p) in summary.problems:
+                    summary.add_problem(_rel(root, p), "Hash check", "UNCHANGED", why)
+                else:
+                    summary.notes.setdefault(_rel(root, p), []).append(("Hash check", why))
             results.append(f"Hash check      : {n_after - len(same)} of {n_after} files have a new content hash"
                            + (f", {len(same)} UNCHANGED (listed in the log)" if same else ""))
+        if summary.problems:
+            results.append(f"Problems        : {len(summary.problems)} file(s) NOT processed as specified "
+                           f"- each one is listed with the reason at the end of the log")
         results.append(f"Finished in {time.time() - started:,.0f}s")
-        for line in results: log.info(line)
         return results
+    except Cancelled:
+        summary.outcome = f"CANCELLED during {current or 'start-up'} (files already processed keep their verified changes)"
+        raise
+    except Exception as e:
+        summary.outcome = f"RUN FAILED during {current or 'start-up'}: {type(e).__name__}: {e}"
+        raise
     finally:
+        try:
+            if summary.outcome != "Finished":
+                results.append(f"Stopped after {time.time() - started:,.0f}s")
+            for line in summary.render(): log.info(line)
+        except Exception as e:   # the summary must never hide the real result of the run
+            log.warning(f"Could not write the run summary: {type(e).__name__}: {e}")
         _sweep_leftover_temp_dirs()
         if handler:
             log.removeHandler(handler)

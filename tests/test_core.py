@@ -221,6 +221,75 @@ def test_video_strip_and_padding(tmp_path):
     status, _ = core.pad_av(clip, ff)                 # the padding tag is replaced, not added again
     assert status == "changed" and clip.read_bytes() != once and len(clip.read_bytes()) == len(once)
 
+@needs_ffmpeg
+def test_video_with_wrong_extension_keeps_its_real_container(tmp_path):
+    """Signal and others save MP4s (AAC audio) as .mpeg: ffmpeg would write MPEG-PS, which cannot hold AAC."""
+    ff, fp = shutil.which("ffmpeg"), shutil.which("ffprobe")
+    clip = tmp_path / "signal-2026-01-16.mpeg"
+    subprocess.run([ff, "-v", "error", "-f", "lavfi", "-i", "testsrc=size=160x120:rate=10:duration=1",
+                    "-f", "lavfi", "-i", "sine=duration=1", "-c:v", "mpeg4", "-c:a", "aac",
+                    "-metadata", "title=secret", "-f", "mp4", str(clip)], check=True)
+    status, detail = core.strip_av(clip, ff)            # without ffprobe: the old failure, now explained
+    assert status == "failed" and "'.mpeg' extension" in detail and "@ 0x" not in detail
+    status, detail = core.strip_av(clip, ff, fp)
+    assert status == "changed" and "really MP4" in detail and b"secret" not in clip.read_bytes()
+    status, _ = core.pad_av(clip, ff, fp)
+    assert status == "changed" and core.real_container(clip, fp) == "mp4" and clip.suffix == ".mpeg"
+
+def test_ffmpeg_errors_keep_the_reason_and_explain_it():
+    mpeg = (b"[mpeg @ 0xb400007e96e8f470] Unsupported audio codec. Must be one of mp1, mp2, mp3, 16-bit pcm_dvd.\n"
+            b"[out#0/mpeg @ 0xb400007d86e8f0b0] Could not write header (incorrect codec parameters ?): Invalid argument\n")
+    msg = core.ffmpeg_error_summary(mpeg)
+    assert msg.startswith("Unsupported audio codec") and "0xb4" not in msg
+    assert "cannot be stored" in core.explain_ffmpeg_error(msg, "mp4", ".mpeg")
+    mp4 = (b"[mp4 @ 0x55] [error] Application provided duration: 7 / timestamp: 9 is out of range for mov/mp4 format\n"
+           + b"[vost#0:0/copy @ 0x5] [error] Error submitting a packet to the muxer: Invalid argument\n" * 2
+           + b"    Last message repeated 1 times\n[out#0/mp4 @ 0x5] [error] Error muxing a packet\n"
+           + b"[out#0/mp4 @ 0x5] [error] Task finished with error code: -22 (Invalid argument)\n")
+    msg = core.ffmpeg_error_summary(mp4)
+    assert msg.startswith("Application provided duration") and "repeated" not in msg and "Task finished" not in msg
+    assert "timestamps" in core.explain_ffmpeg_error(msg)
+    assert "packets" in core.explain_ffmpeg_error(core.ffmpeg_error_summary(mp4.split(b"\n", 1)[1]))
+
+def test_remux_retries_with_regenerated_timestamps(tmp_path, monkeypatch):
+    calls = []
+    def fake_run(cmd, timeout=None):
+        calls.append(cmd)
+        if "+genpts" in cmd:
+            Path(cmd[-1]).write_bytes(b"ok")
+            return subprocess.CompletedProcess(cmd, 0, b"", b"")
+        return subprocess.CompletedProcess(cmd, 1, b"", b"[vost#0:0/copy @ 0x1] [error] Error submitting a packet "
+                                                         b"to the muxer: Invalid argument\n")
+    monkeypatch.setattr(core, "run_cmd", fake_run)
+    src, tmp = tmp_path / "a.mp4", tmp_path / "t.mp4"
+    src.write_bytes(b"x")
+    r, notes, _ = core.remux(src, tmp, "ffmpeg", None, ["-c", "copy"])
+    assert r.returncode == 0 and len(calls) == 2 and any("timestamps regenerated" in n for n in notes)
+
+def test_log_ends_with_summary_of_files_not_processed(tmp_path):
+    build_tree(tmp_path)
+    alb = tmp_path / "Album"
+    (alb / "broken.jpg").write_bytes(b"\xff\xd8\xff\xe0garbage" * 3)
+    log_path = tmp_path.parent / f"{tmp_path.name}_log.txt"
+    results = core.run_pipeline(tmp_path, core.Options(strip=True, dedupe=True, unique_hash=True, use_processes=False),
+                                log_path=log_path)
+    text = log_path.read_text(encoding="utf-8")
+    summary = text[text.index("RUN SUMMARY"):]
+    assert "Outcome         : Finished" in summary and "Files at start  : 5 (5 images" in summary
+    assert "4 of 5 file(s) processed as specified, 1 NOT processed as specified" in summary
+    assert "Files NOT processed as specified (1)" in summary and "| broken.jpg" not in summary
+    block = summary[summary.index("Album/broken.jpg"):]
+    assert "Metadata strip  FAILED" in block and "Deduplication   CORRUPT" in block
+    assert any(r.startswith("Problems        : 1 file(s)") for r in results)
+
+def test_cancelled_run_still_writes_summary(tmp_path):
+    build_tree(tmp_path)
+    stop, log_path = threading.Event(), tmp_path.parent / f"{tmp_path.name}_log.txt"
+    with pytest.raises(core.Cancelled):
+        core.run_pipeline(tmp_path, core.Options(strip=True, use_processes=False),
+                          progress=lambda s, d, t: stop.set(), cancel=stop, log_path=log_path)
+    assert "Outcome         : CANCELLED during" in log_path.read_text(encoding="utf-8")
+
 # ---------------------------------------------------------------- updater
 def fake_github(monkeypatch, files: dict, tamper: str = ""):
     """Serve `files` ({path under src/: bytes}) the way GitHub's tree API and raw file host would."""

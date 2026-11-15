@@ -84,6 +84,16 @@ Saved to a folder you choose (**Run > Log folder > Change...**; the command line
 source. Logs list original file names and hashes, so the app warns when the log folder is inside the folder being
 processed.
 
+Every log ends with a **RUN SUMMARY**: the steps run and how it ended (finished, cancelled or failed), the number of
+files at the start, each step's counts, how many files were processed as specified, and then every file that was
+**not**, one by one, with each step that failed or skipped it and the reason in plain words followed by ffmpeg's own
+message (for example: *its audio/video formats cannot be stored in the MPEG program stream container that the
+'.mpeg' extension stands for*). Files moved to `Corrupted` and files whose hash did not change are listed there too.
+
+Video/audio named with the wrong extension (e.g. an MP4 saved as `.mpeg`, common with messaging apps) are rewritten
+in the container they really are, and keep their name. If the container writer refuses a file's timestamps, the copy
+is tried once more with regenerated timestamps; the audio/video packets are still verified identical either way.
+
 ## Updates (PC)
 
 Every build is a numbered release (`1.0.<build>`). The app shows its own version in the top right (from the copy
